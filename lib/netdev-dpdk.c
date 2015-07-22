@@ -227,6 +227,10 @@ struct netdev_dpdk {
     /* Identifier used to distinguish vhost devices from each other */
     char vhost_id[PATH_MAX];
 
+    /* Rings for secondary processes in IVSHMEM setups, NULL otherwise */
+    struct rte_ring *rx_ring;
+    struct rte_ring *tx_ring;
+
     /* In dpdk_list. */
     struct ovs_list list_node OVS_GUARDED_BY(dpdk_mutex);
 };
@@ -340,12 +344,16 @@ dpdk_mp_get(int socket_id, int mtu) OVS_REQUIRES(dpdk_mutex)
             return NULL;
         }
 
-        dmp->mp = rte_mempool_create(mp_name, mp_size, MBUF_SIZE(mtu),
-                                     MP_CACHE_SZ,
-                                     sizeof(struct rte_pktmbuf_pool_private),
-                                     rte_pktmbuf_pool_init, NULL,
-                                     ovs_rte_pktmbuf_init, NULL,
-                                     socket_id, 0);
+        if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+            dmp->mp = rte_mempool_create(mp_name, mp_size, MBUF_SIZE(mtu),
+                                         MP_CACHE_SZ,
+                                         sizeof(struct rte_pktmbuf_pool_private),
+                                         rte_pktmbuf_pool_init, NULL,
+                                         ovs_rte_pktmbuf_init, NULL,
+                                         socket_id, 0);
+        } else {
+            dmp->mp = rte_mempool_lookup(mp_name);
+        }
     } while (!dmp->mp && rte_errno == ENOMEM && (mp_size /= 2) >= MIN_NB_MBUF);
 
     if (dmp->mp == NULL) {
@@ -439,37 +447,39 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev) OVS_REQUIRES(dpdk_mutex)
     dev->up.n_rxq = MIN(info.max_rx_queues, dev->up.n_rxq);
     dev->real_n_txq = MIN(info.max_tx_queues, dev->up.n_txq);
 
-    diag = rte_eth_dev_configure(dev->port_id, dev->up.n_rxq, dev->real_n_txq,
-                                 &port_conf);
-    if (diag) {
-        VLOG_ERR("eth dev config error %d. rxq:%d txq:%d", diag, dev->up.n_rxq,
-                 dev->real_n_txq);
-        return -diag;
-    }
-
-    for (i = 0; i < dev->real_n_txq; i++) {
-        diag = rte_eth_tx_queue_setup(dev->port_id, i, NIC_PORT_TX_Q_SIZE,
-                                      dev->socket_id, NULL);
+    if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+        diag = rte_eth_dev_configure(dev->port_id, dev->up.n_rxq, dev->real_n_txq,
+                                     &port_conf);
         if (diag) {
-            VLOG_ERR("eth dev tx queue setup error %d",diag);
+            VLOG_ERR("eth dev config error %d. rxq:%d txq:%d", diag, dev->up.n_rxq,
+                     dev->real_n_txq);
             return -diag;
         }
-    }
 
-    for (i = 0; i < dev->up.n_rxq; i++) {
-        diag = rte_eth_rx_queue_setup(dev->port_id, i, NIC_PORT_RX_Q_SIZE,
-                                      dev->socket_id,
-                                      NULL, dev->dpdk_mp->mp);
+        for (i = 0; i < dev->real_n_txq; i++) {
+            diag = rte_eth_tx_queue_setup(dev->port_id, i, NIC_PORT_TX_Q_SIZE,
+                                          dev->socket_id, NULL);
+            if (diag) {
+                VLOG_ERR("eth dev tx queue setup error %d",diag);
+                return -diag;
+            }
+        }
+
+        for (i = 0; i < dev->up.n_rxq; i++) {
+            diag = rte_eth_rx_queue_setup(dev->port_id, i, NIC_PORT_RX_Q_SIZE,
+                                          dev->socket_id,
+                                          NULL, dev->dpdk_mp->mp);
+            if (diag) {
+                VLOG_ERR("eth dev rx queue setup error %d",diag);
+                return -diag;
+            }
+        }
+
+        diag = rte_eth_dev_start(dev->port_id);
         if (diag) {
-            VLOG_ERR("eth dev rx queue setup error %d",diag);
+            VLOG_ERR("eth dev start error %d",diag);
             return -diag;
         }
-    }
-
-    diag = rte_eth_dev_start(dev->port_id);
-    if (diag) {
-        VLOG_ERR("eth dev start error %d",diag);
-        return -diag;
     }
 
     rte_eth_promiscuous_enable(dev->port_id);
@@ -532,6 +542,8 @@ netdev_dpdk_init(struct netdev *netdev_, unsigned int port_no,
     OVS_REQUIRES(dpdk_mutex)
 {
     struct netdev_dpdk *netdev = netdev_dpdk_cast(netdev_);
+    char *rxq_name = xasprintf("%s_tx", netdev->up.name);
+    char *txq_name = xasprintf("%s_rx", netdev->up.name);
     int sid;
     int err = 0;
 
@@ -573,6 +585,19 @@ netdev_dpdk_init(struct netdev *netdev_, unsigned int port_no,
             goto unlock;
         }
     }
+
+    if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+        netdev->rx_ring = netdev->tx_ring = NULL;
+    } else {
+        netdev->rx_ring = rte_ring_lookup(rxq_name);
+        netdev->tx_ring = rte_ring_lookup(txq_name);
+        if (!netdev->rx_ring || !netdev->tx_ring) {
+            err = ENOMEM;
+        }
+    }
+
+    free(rxq_name);
+    free(txq_name);
 
     list_push_back(&dpdk_list, &netdev->list_node);
 
@@ -957,6 +982,36 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq_, struct dp_packet **packets,
     return 0;
 }
 
+static int
+netdev_dpdk_ring_rxq_recv(struct netdev_rxq *rxq_,
+                           struct dp_packet **packets, int *c)
+{
+    struct netdev_dpdk *netdev = netdev_dpdk_cast(rxq_->netdev);
+    struct rte_ring *rx_ring = netdev->rx_ring;
+    unsigned rx_pkts = NETDEV_MAX_BURST;
+
+    /* Only use netdev_dpdk_ring_rxq_recv() as a secondary process. There are operations
+     * performed by netdev_dpdk_rxq_recv() that primary processes are responsible for and
+     * cannot be performed by secondary processes. */
+    if (OVS_LIKELY(rte_eal_process_type() == RTE_PROC_PRIMARY)) {
+        return netdev_dpdk_rxq_recv(rxq_,packets,c);
+    }
+
+    while (OVS_UNLIKELY(rte_ring_dequeue_bulk(rx_ring, (void **)packets, rx_pkts) != 0) &&
+        rx_pkts > 0) {
+        rx_pkts = rte_ring_count(rx_ring);
+        rx_pkts = (unsigned)MIN(rx_pkts,NETDEV_MAX_BURST);
+    }
+    
+    if (!rx_pkts) {
+        return EAGAIN;
+    }
+
+    *c = rx_pkts;
+
+    return 0;
+}
+
 static void
 __netdev_dpdk_vhost_send(struct netdev *netdev, struct dp_packet **pkts,
                          int cnt, bool may_steal)
@@ -1144,6 +1199,20 @@ netdev_dpdk_vhost_send(struct netdev *netdev, int qid OVS_UNUSED, struct dp_pack
         __netdev_dpdk_vhost_send(netdev, pkts, cnt, may_steal);
     }
     return 0;
+}
+
+static inline void
+netdev_dpdk_ring_send__(struct netdev_dpdk *netdev,
+                        struct dp_packet **pkts, int cnt)
+{
+    struct rte_ring *tx_ring = netdev->tx_ring;
+    int rslt = 0;
+
+    if (tx_ring != NULL) {
+        do {
+            rslt = rte_ring_enqueue_bulk(tx_ring, (void **)pkts, cnt);
+        } while (rslt == -ENOBUFS);
+    }
 }
 
 static inline void
@@ -1812,8 +1881,13 @@ dpdk_ring_create(const char dev_name[], unsigned int port_no,
     }
 
     /* Create single consumer/producer rings, netdev does explicit locking. */
-    ivshmem->cring_tx = rte_ring_create(ring_name, DPDK_RING_SIZE, SOCKET0,
-                                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+        ivshmem->cring_tx = rte_ring_create(ring_name, DPDK_RING_SIZE, SOCKET0,
+                                            RING_F_SP_ENQ | RING_F_SC_DEQ);
+    } else {
+        ivshmem->cring_tx = rte_ring_lookup(ring_name);
+    }
+
     if (ivshmem->cring_tx == NULL) {
         rte_free(ivshmem);
         return ENOMEM;
@@ -1825,8 +1899,13 @@ dpdk_ring_create(const char dev_name[], unsigned int port_no,
     }
 
     /* Create single consumer/producer rings, netdev does explicit locking. */
-    ivshmem->cring_rx = rte_ring_create(ring_name, DPDK_RING_SIZE, SOCKET0,
-                                        RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+        ivshmem->cring_rx = rte_ring_create(ring_name, DPDK_RING_SIZE, SOCKET0,
+                                            RING_F_SP_ENQ | RING_F_SC_DEQ);
+    } else {
+        ivshmem->cring_rx = rte_ring_lookup(ring_name);
+    }
+
     if (ivshmem->cring_rx == NULL) {
         rte_free(ivshmem);
         return ENOMEM;
@@ -1888,7 +1967,14 @@ netdev_dpdk_ring_send(struct netdev *netdev_, int qid,
         dp_packet_set_rss_hash(pkts[i], 0);
     }
 
-    netdev_dpdk_send__(netdev, qid, pkts, cnt, may_steal);
+    /* Only use netdev_dpdk_send__() as a primary process. It leads to the execution
+     * of code that cannot be executed by secondary processes. */
+    if (OVS_LIKELY(rte_eal_process_type() == RTE_PROC_PRIMARY)) {
+        netdev_dpdk_send__(netdev, qid, pkts, cnt, may_steal);
+    } else {
+        netdev_dpdk_ring_send__(netdev, pkts, cnt);
+    }
+
     return 0;
 }
 
@@ -2101,7 +2187,7 @@ static const struct netdev_class dpdk_ring_class =
         netdev_dpdk_get_stats,
         netdev_dpdk_get_features,
         netdev_dpdk_get_status,
-        netdev_dpdk_rxq_recv);
+        netdev_dpdk_ring_rxq_recv);
 
 static const struct netdev_class OVS_UNUSED dpdk_vhost_cuse_class =
     NETDEV_DPDK_CLASS(
