@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#! /usr/bin/env python
 # Copyright (c) 2013, 2014, 2015 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -327,7 +327,7 @@ Basic Configuration:
 
     # First install the basic requirements needed to build Open vSwitch.
     sudo apt-get install git build-essential libtool autoconf pkg-config \\
-            libssl-dev gdb libcap-ng linux-headers-`uname -r`
+            libssl-dev gdb libcap-ng-dev linux-headers-`uname -r`
 
     # Next clone the Open vSwitch source.
     git clone https://github.com/openvswitch/ovs.git %(ovs)s

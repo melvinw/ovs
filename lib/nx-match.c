@@ -754,6 +754,14 @@ nxm_put_64m(struct ofpbuf *b, enum mf_field_id field, enum ofp_version version,
 }
 
 static void
+nxm_put_128m(struct ofpbuf *b,
+             enum mf_field_id field, enum ofp_version version,
+             const ovs_be128 value, const ovs_be128 mask)
+{
+    nxm_put(b, field, version, &value, &mask, sizeof(value));
+}
+
+static void
 nxm_put_eth_masked(struct ofpbuf *b,
                    enum mf_field_id field, enum ofp_version version,
                    const struct eth_addr value, const struct eth_addr mask)
@@ -779,18 +787,6 @@ nxm_put_frag(struct ofpbuf *b, const struct match *match,
 
     nxm_put_8m(b, MFF_IP_FRAG, version, nw_frag,
                nw_frag_mask == FLOW_NW_FRAG_MASK ? UINT8_MAX : nw_frag_mask);
-}
-
-static void
-nxm_put_ct_label(struct ofpbuf *b,
-                 enum mf_field_id field, enum ofp_version version,
-                 const ovs_u128 value, const ovs_u128 mask)
-{
-    ovs_be128 bevalue, bemask;
-
-    hton128(&value, &bevalue);
-    hton128(&mask, &bemask);
-    nxm_put(b, field, version, &bevalue, &bemask, sizeof(bevalue));
 }
 
 /* Appends to 'b' a set of OXM or NXM matches for the IPv4 or IPv6 fields in
@@ -913,7 +909,7 @@ nx_put_raw(struct ofpbuf *b, enum ofp_version oxm, const struct match *match,
     int match_len;
     int i;
 
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
 
     /* Metadata. */
     if (match->wc.masks.dp_hash) {
@@ -1024,6 +1020,10 @@ nx_put_raw(struct ofpbuf *b, enum ofp_version oxm, const struct match *match,
                 flow->tunnel.ip_src, match->wc.masks.tunnel.ip_src);
     nxm_put_32m(b, MFF_TUN_DST, oxm,
                 flow->tunnel.ip_dst, match->wc.masks.tunnel.ip_dst);
+    nxm_put_ipv6(b, MFF_TUN_IPV6_SRC, oxm,
+                 &flow->tunnel.ipv6_src, &match->wc.masks.tunnel.ipv6_src);
+    nxm_put_ipv6(b, MFF_TUN_IPV6_DST, oxm,
+                 &flow->tunnel.ipv6_dst, &match->wc.masks.tunnel.ipv6_dst);
     nxm_put_16m(b, MFF_TUN_GBP_ID, oxm,
                 flow->tunnel.gbp_id, match->wc.masks.tunnel.gbp_id);
     nxm_put_8m(b, MFF_TUN_GBP_FLAGS, oxm,
@@ -1055,8 +1055,8 @@ nx_put_raw(struct ofpbuf *b, enum ofp_version oxm, const struct match *match,
                 htons(match->wc.masks.ct_zone));
     nxm_put_32m(b, MFF_CT_MARK, oxm, htonl(flow->ct_mark),
                 htonl(match->wc.masks.ct_mark));
-    nxm_put_ct_label(b, MFF_CT_LABEL, oxm, flow->ct_label,
-                     match->wc.masks.ct_label);
+    nxm_put_128m(b, MFF_CT_LABEL, oxm, hton128(flow->ct_label),
+                 hton128(match->wc.masks.ct_label));
 
     /* OpenFlow 1.1+ Metadata. */
     nxm_put_64m(b, MFF_METADATA, oxm,

@@ -351,7 +351,7 @@ parse_ofp_str__(struct ofputil_flow_mod *fm, int command, char *string,
     fm->out_port = OFPP_ANY;
     fm->flags = 0;
     fm->importance = 0;
-    fm->out_group = OFPG11_ANY;
+    fm->out_group = OFPG_ANY;
     fm->delete_reason = OFPRR_DELETE;
     if (fields & F_ACTIONS) {
         act_str = extract_actions(string);
@@ -401,6 +401,12 @@ parse_ofp_str__(struct ofputil_flow_mod *fm, int command, char *string,
             } else if (fields & F_OUT_PORT && !strcmp(name, "out_port")) {
                 if (!ofputil_port_from_string(value, &fm->out_port)) {
                     error = xasprintf("%s is not a valid OpenFlow port",
+                                      value);
+                }
+            } else if (fields & F_OUT_PORT && !strcmp(name, "out_group")) {
+                *usable_protocols &= OFPUTIL_P_OF11_UP;
+                if (!ofputil_group_from_string(value, &fm->out_group)) {
+                    error = xasprintf("%s is not a valid OpenFlow group",
                                       value);
                 }
             } else if (fields & F_PRIORITY && !strcmp(name, "priority")) {
@@ -880,6 +886,49 @@ parse_ofp_flow_mod_str(struct ofputil_flow_mod *fm, const char *string,
     return error;
 }
 
+/* Convert 'setting' (as described for the "mod-table" command
+ * in ovs-ofctl man page) into 'tm->table_vacancy->vacancy_up' and
+ * 'tm->table_vacancy->vacancy_down' threshold values.
+ * For the two threshold values, value of vacancy_up is always greater
+ * than value of vacancy_down.
+ *
+ * Returns NULL if successful, otherwise a malloc()'d string describing the
+ * error.  The caller is responsible for freeing the returned string. */
+char * OVS_WARN_UNUSED_RESULT
+parse_ofp_table_vacancy(struct ofputil_table_mod *tm, const char *setting)
+{
+    char *save_ptr = NULL;
+    char *vac_up, *vac_down;
+    char *value = strdup(setting);
+    int vacancy_up, vacancy_down;
+
+    strtok_r(value, ":", &save_ptr);
+    vac_down = strtok_r(NULL, ",", &save_ptr);
+    if (!vac_down) {
+        return xasprintf("Vacancy down value missing");
+    }
+    if (!str_to_int(vac_down, 0, &vacancy_down) ||
+        vacancy_down < 0 || vacancy_down > 100) {
+        return xasprintf("Invalid vacancy down value \"%s\"", vac_down);
+    }
+    vac_up = strtok_r(NULL, ",", &save_ptr);
+    if (!vac_up) {
+        return xasprintf("Vacancy up value missing");
+    }
+    if (!str_to_int(vac_up, 0, &vacancy_up) ||
+        vacancy_up < 0 || vacancy_up > 100) {
+        return xasprintf("Invalid vacancy up value \"%s\"", vac_up);
+    }
+    if (vacancy_down > vacancy_up) {
+        return xasprintf("Invalid vacancy range, vacancy up should be greater"
+                         " than vacancy down ""(%s)",
+                         ofperr_to_string(OFPERR_OFPBPC_BAD_VALUE));
+    }
+    tm->table_vacancy.vacancy_down = vacancy_down;
+    tm->table_vacancy.vacancy_up = vacancy_up;
+    return NULL;
+}
+
 /* Convert 'table_id' and 'setting' (as described for the "mod-table" command
  * in the ovs-ofctl man page) into 'tm' for sending a table_mod command to a
  * switch.
@@ -906,13 +955,13 @@ parse_ofp_table_mod(struct ofputil_table_mod *tm, const char *table_id,
     tm->miss = OFPUTIL_TABLE_MISS_DEFAULT;
     tm->eviction = OFPUTIL_TABLE_EVICTION_DEFAULT;
     tm->eviction_flags = UINT32_MAX;
-
+    tm->vacancy = OFPUTIL_TABLE_VACANCY_DEFAULT;
+    tm->table_vacancy.vacancy_down = 0;
+    tm->table_vacancy.vacancy_up = 0;
+    tm->table_vacancy.vacancy = 0;
     /* Only OpenFlow 1.1 and 1.2 can configure table-miss via table_mod.
-     * Only OpenFlow 1.4+ can configure eviction via table_mod.
-     *
-     * (OpenFlow 1.4+ can also configure vacancy events via table_mod, but OVS
-     * doesn't support those yet and they're also logically a per-OpenFlow
-     * session setting so it wouldn't make sense to support them here anyway.)
+     * Only OpenFlow 1.4+ can configure eviction and vacancy events
+     * via table_mod.
      */
     if (!strcmp(setting, "controller")) {
         tm->miss = OFPUTIL_TABLE_MISS_CONTROLLER;
@@ -928,6 +977,16 @@ parse_ofp_table_mod(struct ofputil_table_mod *tm, const char *table_id,
         *usable_versions = (1 << OFP14_VERSION) | (1u << OFP15_VERSION);
     } else if (!strcmp(setting, "noevict")) {
         tm->eviction = OFPUTIL_TABLE_EVICTION_OFF;
+        *usable_versions = (1 << OFP14_VERSION) | (1u << OFP15_VERSION);
+    } else if (!strncmp(setting, "vacancy", strcspn(setting, ":"))) {
+        tm->vacancy = OFPUTIL_TABLE_VACANCY_ON;
+        *usable_versions = (1 << OFP14_VERSION) | (1u << OFP15_VERSION);
+        char *error = parse_ofp_table_vacancy(tm, setting);
+        if (error) {
+            return error;
+        }
+    } else if (!strcmp(setting, "novacancy")) {
+        tm->vacancy = OFPUTIL_TABLE_VACANCY_OFF;
         *usable_versions = (1 << OFP14_VERSION) | (1u << OFP15_VERSION);
     } else {
         return xasprintf("invalid table_mod setting %s", setting);
@@ -1165,7 +1224,7 @@ parse_bucket_str(struct ofputil_bucket *bucket, char *str_, uint8_t group_type,
     bucket->weight = group_type == OFPGT11_SELECT ? 1 : 0;
     bucket->bucket_id = OFPG15_BUCKET_ALL;
     bucket->watch_port = OFPP_ANY;
-    bucket->watch_group = OFPG11_ANY;
+    bucket->watch_group = OFPG_ANY;
 
     ds_init(&actions);
 
@@ -1605,30 +1664,30 @@ parse_ofp_group_mod_file(const char *file_name, uint16_t command,
 }
 
 char * OVS_WARN_UNUSED_RESULT
-parse_ofp_geneve_table_mod_str(struct ofputil_geneve_table_mod *gtm,
+parse_ofp_tlv_table_mod_str(struct ofputil_tlv_table_mod *ttm,
                                uint16_t command, const char *s,
                                enum ofputil_protocol *usable_protocols)
 {
     *usable_protocols = OFPUTIL_P_NXM_OXM_ANY;
 
-    gtm->command = command;
-    list_init(&gtm->mappings);
+    ttm->command = command;
+    list_init(&ttm->mappings);
 
     while (*s) {
-        struct ofputil_geneve_map *map = xmalloc(sizeof *map);
+        struct ofputil_tlv_map *map = xmalloc(sizeof *map);
         int n;
 
         if (*s == ',') {
             s++;
         }
 
-        list_push_back(&gtm->mappings, &map->list_node);
+        list_push_back(&ttm->mappings, &map->list_node);
 
         if (!ovs_scan(s, "{class=%"SCNi16",type=%"SCNi8",len=%"SCNi8"}->tun_metadata%"SCNi16"%n",
                       &map->option_class, &map->option_type, &map->option_len,
                       &map->index, &n)) {
-            ofputil_uninit_geneve_table(&gtm->mappings);
-            return xstrdup("invalid geneve mapping");
+            ofputil_uninit_tlv_table(&ttm->mappings);
+            return xstrdup("invalid tlv mapping");
         }
 
         s += n;

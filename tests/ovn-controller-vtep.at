@@ -13,6 +13,7 @@ AT_BANNER([ovn_controller_vtep])
 #
 m4_define([OVN_CONTROLLER_VTEP_START],
   [
+   AT_KEYWORDS([ovn])
    # this will cause skip when 'make check' using Windows setup.
    AT_SKIP_IF([test $HAVE_PYTHON = no])
 
@@ -113,6 +114,7 @@ AT_SETUP([ovn-controller-vtep - test chassis])
 OVN_CONTROLLER_VTEP_START
 
 # verifies the initial ovn-sb db configuration.
+OVS_WAIT_UNTIL([test -n "`ovn-sbctl show | grep Chassis`"])
 AT_CHECK([ovn-sbctl show], [0], [dnl
 Chassis br-vtep
     Encap vxlan

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#! /usr/bin/env python
 # Copyright (C) 2013 Nicira, Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -650,6 +650,13 @@ def setup():
                   % (bfd_bridge, bfd_bridge, ps_type))
     else:
         ovs_vsctl("add-br %s" % bfd_bridge)
+
+    # Remove local-mac entries from the previous run.  Otherwise, if a vlan
+    # binding is removed while the emulator is *not* running, the corresponding
+    # local-mac entries are never cleaned up.
+    vtep_ls = set(vtep_ctl("list-ls").split())
+    for ls_name in vtep_ls:
+        vtep_ctl("clear-local-macs %s" % ls_name)
 
 
 def main():

@@ -287,12 +287,13 @@ enum {
 
 
 typedef struct _OVS_EVENT_ENTRY {
-    uint32_t portNo;
-    uint32_t status;
+    UINT32 portNo;
+    OVS_VPORT_TYPE ovsType;
+    UINT32 upcallPid;
+    CHAR ovsName[OVS_MAX_PORT_NAME_LENGTH];
+    UINT32 type;
 } OVS_EVENT_ENTRY, *POVS_EVENT_ENTRY;
 
-#define OVS_DEFAULT_PORT_NO 0xffffffff
-#define OVS_DEFAULT_EVENT_STATUS  0xffffffff
 
 typedef struct _OVS_EVENT_STATUS {
     uint32_t numberEntries;

@@ -44,7 +44,7 @@
 #include "shash.h"
 #include "sset.h"
 #include "timeval.h"
-#include "tnl-arp-cache.h"
+#include "tnl-neigh-cache.h"
 #include "tnl-ports.h"
 #include "util.h"
 #include "uuid.h"
@@ -122,7 +122,7 @@ dp_initialize(void)
         tnl_conf_seq = seq_create();
         dpctl_unixctl_register();
         tnl_port_map_init();
-        tnl_arp_cache_init();
+        tnl_neigh_cache_init();
         route_table_init();
 
         for (i = 0; i < ARRAY_SIZE(base_dpif_classes); i++) {
@@ -1107,8 +1107,10 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet **packets, int cnt,
         struct ofpbuf execute_actions;
         uint64_t stub[256 / 8];
         struct pkt_metadata *md = &packet->md;
+        bool dst_set;
 
-        if (md->tunnel.ip_dst) {
+        dst_set = flow_tnl_dst_is_set(&md->tunnel);
+        if (dst_set) {
             /* The Linux kernel datapath throws away the tunnel information
              * that we supply as metadata.  We have to use a "set" action to
              * supply it. */
@@ -1130,7 +1132,7 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet **packets, int cnt,
         aux->error = dpif_execute(aux->dpif, &execute);
         log_execute_message(aux->dpif, &execute, true, aux->error);
 
-        if (md->tunnel.ip_dst) {
+        if (dst_set) {
             ofpbuf_uninit(&execute_actions);
         }
         break;

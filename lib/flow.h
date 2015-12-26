@@ -40,7 +40,7 @@ struct match;
 /* This sequence number should be incremented whenever anything involving flows
  * or the wildcarding of flows changes.  This will cause build assertion
  * failures in places which likely need to be updated. */
-#define FLOW_WC_SEQ 34
+#define FLOW_WC_SEQ 35
 
 /* Number of Open vSwitch extension 32-bit registers. */
 #define FLOW_N_REGS 8
@@ -159,7 +159,7 @@ BUILD_ASSERT_DECL(sizeof(struct flow_tnl) % sizeof(uint64_t) == 0);
 /* Remember to update FLOW_WC_SEQ when changing 'struct flow'. */
 BUILD_ASSERT_DECL(offsetof(struct flow, igmp_group_ip4) + sizeof(uint32_t)
                   == sizeof(struct flow_tnl) + 216
-                  && FLOW_WC_SEQ == 34);
+                  && FLOW_WC_SEQ == 35);
 
 /* Incremental points at which flow classification may be performed in
  * segments.
@@ -788,14 +788,12 @@ miniflow_get__(const struct miniflow *mf, size_t idx)
      [FLOW_U64_OFFREM(FIELD) / sizeof(TYPE)]                            \
      : 0)
 
-/* Get a pointer to the ovs_u128 value of struct flow 'FIELD' from miniflow
- * 'FLOW'. */
-#define MINIFLOW_GET_U128_PTR(FLOW, FIELD)                              \
-    ((MINIFLOW_IN_MAP(FLOW, FLOW_U64_OFFSET(FIELD))                     \
-      && (MINIFLOW_IN_MAP(FLOW, FLOW_U64_OFFSET(FIELD) + 1)))           \
-     ? &((OVS_FORCE const ovs_u128 *)miniflow_get__(FLOW, FLOW_U64_OFFSET(FIELD))) \
-     [FLOW_U64_OFFREM(FIELD) / sizeof(ovs_u128)]                        \
-     : NULL)
+#define MINIFLOW_GET_U128(FLOW, FIELD)                                  \
+    (ovs_u128) { .u64 = {                                               \
+            (MINIFLOW_IN_MAP(FLOW, FLOW_U64_OFFSET(FIELD)) ?            \
+             *miniflow_get__(FLOW, FLOW_U64_OFFSET(FIELD)) : 0),        \
+            (MINIFLOW_IN_MAP(FLOW, FLOW_U64_OFFSET(FIELD) + 1) ?        \
+             *miniflow_get__(FLOW, FLOW_U64_OFFSET(FIELD) + 1) : 0) } }
 
 #define MINIFLOW_GET_U8(FLOW, FIELD)            \
     MINIFLOW_GET_TYPE(FLOW, uint8_t, FIELD)

@@ -64,7 +64,7 @@
 #include "shash.h"
 #include "sset.h"
 #include "timeval.h"
-#include "tnl-arp-cache.h"
+#include "tnl-neigh-cache.h"
 #include "tnl-ports.h"
 #include "unixctl.h"
 #include "util.h"
@@ -1858,33 +1858,29 @@ dpif_netdev_mask_from_nlattrs(const struct nlattr *key, uint32_t key_len,
                               uint32_t mask_key_len, const struct flow *flow,
                               struct flow_wildcards *wc)
 {
-    if (mask_key_len) {
-        enum odp_key_fitness fitness;
+    enum odp_key_fitness fitness;
 
-        fitness = odp_flow_key_to_mask_udpif(mask_key, mask_key_len, key,
-                                             key_len, &wc->masks, flow);
-        if (fitness) {
-            /* This should not happen: it indicates that
-             * odp_flow_key_from_mask() and odp_flow_key_to_mask()
-             * disagree on the acceptable form of a mask.  Log the problem
-             * as an error, with enough details to enable debugging. */
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+    fitness = odp_flow_key_to_mask_udpif(mask_key, mask_key_len, key,
+                                         key_len, wc, flow);
+    if (fitness) {
+        /* This should not happen: it indicates that
+         * odp_flow_key_from_mask() and odp_flow_key_to_mask()
+         * disagree on the acceptable form of a mask.  Log the problem
+         * as an error, with enough details to enable debugging. */
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
 
-            if (!VLOG_DROP_ERR(&rl)) {
-                struct ds s;
+        if (!VLOG_DROP_ERR(&rl)) {
+            struct ds s;
 
-                ds_init(&s);
-                odp_flow_format(key, key_len, mask_key, mask_key_len, NULL, &s,
-                                true);
-                VLOG_ERR("internal error parsing flow mask %s (%s)",
-                         ds_cstr(&s), odp_key_fitness_to_string(fitness));
-                ds_destroy(&s);
-            }
-
-            return EINVAL;
+            ds_init(&s);
+            odp_flow_format(key, key_len, mask_key, mask_key_len, NULL, &s,
+                            true);
+            VLOG_ERR("internal error parsing flow mask %s (%s)",
+                     ds_cstr(&s), odp_key_fitness_to_string(fitness));
+            ds_destroy(&s);
         }
-    } else {
-        flow_wildcards_init_for_packet(wc, flow);
+
+        return EINVAL;
     }
 
     return 0;
@@ -1993,6 +1989,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
         struct match match;
         struct ds ds = DS_EMPTY_INITIALIZER;
 
+        match.tun_md.valid = false;
         match.flow = flow->flow;
         miniflow_expand(&flow->cr.mask->mf, &match.wc.masks);
 
@@ -2555,7 +2552,7 @@ dpif_netdev_run(struct dpif *dpif)
     ovs_mutex_unlock(&dp->non_pmd_mutex);
     dp_netdev_pmd_unref(non_pmd);
 
-    tnl_arp_cache_run();
+    tnl_neigh_cache_run();
     tnl_port_map_run();
     new_tnl_seq = seq_read(tnl_conf_seq);
 
@@ -3069,14 +3066,18 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
     /* Translate tunnel metadata masks to datapath format. */
     if (wc) {
         if (wc->masks.tunnel.metadata.present.map) {
-            struct geneve_opt opts[GENEVE_TOT_OPT_SIZE /
+            struct geneve_opt opts[TLV_TOT_OPT_SIZE /
                                    sizeof(struct geneve_opt)];
 
-            tun_metadata_to_geneve_udpif_mask(&flow->tunnel,
-                                              &wc->masks.tunnel,
-                                              orig_tunnel.metadata.opts.gnv,
-                                              orig_tunnel.metadata.present.len,
-                                              opts);
+            if (orig_tunnel.flags & FLOW_TNL_F_UDPIF) {
+                tun_metadata_to_geneve_udpif_mask(&flow->tunnel,
+                                                  &wc->masks.tunnel,
+                                                  orig_tunnel.metadata.opts.gnv,
+                                                  orig_tunnel.metadata.present.len,
+                                                  opts);
+            } else {
+                orig_tunnel.metadata.present.len = 0;
+            }
 
             memset(&wc->masks.tunnel.metadata, 0,
                    sizeof wc->masks.tunnel.metadata);
@@ -3300,6 +3301,7 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
 
             miss_cnt++;
 
+            match.tun_md.valid = false;
             miniflow_expand(&keys[i].mf, &match.flow);
 
             ofpbuf_clear(&actions);
@@ -3687,6 +3689,10 @@ const struct dpif_class dpif_netdev_class = {
     dpif_netdev_enable_upcall,
     dpif_netdev_disable_upcall,
     dpif_netdev_get_datapath_version,
+    NULL,                       /* ct_dump_start */
+    NULL,                       /* ct_dump_next */
+    NULL,                       /* ct_dump_done */
+    NULL,                       /* ct_flush */
 };
 
 static void
@@ -3786,7 +3792,14 @@ dpif_dummy_register__(const char *type)
 static void
 dpif_dummy_override(const char *type)
 {
-    if (!dp_unregister_provider(type)) {
+    int error;
+
+    /*
+     * Ignore EAFNOSUPPORT to allow --enable-dummy=system with
+     * a userland-only build.  It's useful for testsuite.
+     */
+    error = dp_unregister_provider(type);
+    if (error == 0 || error == EAFNOSUPPORT) {
         dpif_dummy_register__(type);
     }
 }

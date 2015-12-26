@@ -123,7 +123,7 @@ struct mf_ctx {
  * away.  Some GCC versions gave warnings on ALWAYS_INLINE, so these are
  * defined as macros. */
 
-#if (FLOW_WC_SEQ != 34)
+#if (FLOW_WC_SEQ != 35)
 #define MINIFLOW_ASSERT(X) ovs_assert(X)
 BUILD_MESSAGE("FLOW_WC_SEQ changed: miniflow_extract() will have runtime "
                "assertions enabled. Consider updating FLOW_WC_SEQ after "
@@ -263,7 +263,7 @@ BUILD_MESSAGE("FLOW_WC_SEQ changed: miniflow_extract() will have runtime "
     miniflow_push_be16_(MF, offsetof(struct flow, FIELD), VALUE)
 
 #define miniflow_pad_to_64(MF, FIELD)                       \
-    miniflow_pad_to_64_(MF, offsetof(struct flow, FIELD))
+    miniflow_pad_to_64_(MF, OFFSETOFEND(struct flow, FIELD))
 
 #define miniflow_push_words(MF, FIELD, VALUEP, N_WORDS)                 \
     miniflow_push_words_(MF, offsetof(struct flow, FIELD), VALUEP, N_WORDS)
@@ -449,7 +449,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
     uint8_t nw_frag, nw_tos, nw_ttl, nw_proto;
 
     /* Metadata. */
-    if (md->tunnel.ip_dst) {
+    if (flow_tnl_dst_is_set(&md->tunnel)) {
         miniflow_push_words(mf, tunnel, &md->tunnel,
                             offsetof(struct flow_tnl, metadata) /
                             sizeof(uint64_t));
@@ -485,7 +485,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
 
     if (md->ct_state) {
         miniflow_push_uint32(mf, ct_mark, md->ct_mark);
-        miniflow_pad_to_64(mf, pad1);
+        miniflow_pad_to_64(mf, ct_mark);
 
         if (!ovs_u128_is_zero(&md->ct_label)) {
             miniflow_push_words(mf, ct_label, &md->ct_label,
@@ -695,7 +695,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                 arp_buf[0] = arp->ar_sha;
                 arp_buf[1] = arp->ar_tha;
                 miniflow_push_macs(mf, arp_sha, arp_buf);
-                miniflow_pad_to_64(mf, tcp_flags);
+                miniflow_pad_to_64(mf, arp_tha);
             }
         }
         goto out;
@@ -715,7 +715,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                                    TCP_FLAGS_BE32(tcp->tcp_ctl));
                 miniflow_push_be16(mf, tp_src, tcp->tcp_src);
                 miniflow_push_be16(mf, tp_dst, tcp->tcp_dst);
-                miniflow_pad_to_64(mf, igmp_group_ip4);
+                miniflow_pad_to_64(mf, tp_dst);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_UDP)) {
             if (OVS_LIKELY(size >= UDP_HEADER_LEN)) {
@@ -723,7 +723,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
 
                 miniflow_push_be16(mf, tp_src, udp->udp_src);
                 miniflow_push_be16(mf, tp_dst, udp->udp_dst);
-                miniflow_pad_to_64(mf, igmp_group_ip4);
+                miniflow_pad_to_64(mf, tp_dst);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_SCTP)) {
             if (OVS_LIKELY(size >= SCTP_HEADER_LEN)) {
@@ -731,7 +731,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
 
                 miniflow_push_be16(mf, tp_src, sctp->sctp_src);
                 miniflow_push_be16(mf, tp_dst, sctp->sctp_dst);
-                miniflow_pad_to_64(mf, igmp_group_ip4);
+                miniflow_pad_to_64(mf, tp_dst);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_ICMP)) {
             if (OVS_LIKELY(size >= ICMP_HEADER_LEN)) {
@@ -739,7 +739,7 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
 
                 miniflow_push_be16(mf, tp_src, htons(icmp->icmp_type));
                 miniflow_push_be16(mf, tp_dst, htons(icmp->icmp_code));
-                miniflow_pad_to_64(mf, igmp_group_ip4);
+                miniflow_pad_to_64(mf, tp_dst);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_IGMP)) {
             if (OVS_LIKELY(size >= IGMP_HEADER_LEN)) {
@@ -762,10 +762,10 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                                         sizeof *nd_target / sizeof(uint64_t));
                 }
                 miniflow_push_macs(mf, arp_sha, arp_buf);
-                miniflow_pad_to_64(mf, tcp_flags);
+                miniflow_pad_to_64(mf, arp_tha);
                 miniflow_push_be16(mf, tp_src, htons(icmp->icmp6_type));
                 miniflow_push_be16(mf, tp_dst, htons(icmp->icmp6_code));
-                miniflow_pad_to_64(mf, igmp_group_ip4);
+                miniflow_pad_to_64(mf, tp_dst);
             }
         }
     }
@@ -805,7 +805,7 @@ flow_get_metadata(const struct flow *flow, struct match *flow_metadata)
 {
     int i;
 
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
 
     match_init_catchall(flow_metadata);
     if (flow->tunnel.tun_id != htonll(0)) {
@@ -815,11 +815,17 @@ flow_get_metadata(const struct flow *flow, struct match *flow_metadata)
         match_set_tun_flags(flow_metadata,
                             flow->tunnel.flags & FLOW_TNL_PUB_F_MASK);
     }
-    if (flow->tunnel.ip_src != htonl(0)) {
+    if (flow->tunnel.ip_src) {
         match_set_tun_src(flow_metadata, flow->tunnel.ip_src);
     }
-    if (flow->tunnel.ip_dst != htonl(0)) {
+    if (flow->tunnel.ip_dst) {
         match_set_tun_dst(flow_metadata, flow->tunnel.ip_dst);
+    }
+    if (ipv6_addr_is_set(&flow->tunnel.ipv6_src)) {
+        match_set_tun_ipv6_src(flow_metadata, &flow->tunnel.ipv6_src);
+    }
+    if (ipv6_addr_is_set(&flow->tunnel.ipv6_dst)) {
+        match_set_tun_ipv6_dst(flow_metadata, &flow->tunnel.ipv6_dst);
     }
     if (flow->tunnel.gbp_id != htons(0)) {
         match_set_tun_gbp_id(flow_metadata, flow->tunnel.gbp_id);
@@ -872,6 +878,10 @@ const char *ct_state_to_string(uint32_t state)
         return "rel";
     case CS_INVALID:
         return "inv";
+    case CS_SRC_NAT:
+        return "snat";
+    case CS_DST_NAT:
+        return "dnat";
     default:
         return NULL;
     }
@@ -1201,14 +1211,16 @@ void flow_wildcards_init_for_packet(struct flow_wildcards *wc,
     memset(&wc->masks, 0x0, sizeof wc->masks);
 
     /* Update this function whenever struct flow changes. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
 
-    if (flow->tunnel.ip_dst) {
+    if (flow_tnl_dst_is_set(&flow->tunnel)) {
         if (flow->tunnel.flags & FLOW_TNL_F_KEY) {
             WC_MASK_FIELD(wc, tunnel.tun_id);
         }
         WC_MASK_FIELD(wc, tunnel.ip_src);
         WC_MASK_FIELD(wc, tunnel.ip_dst);
+        WC_MASK_FIELD(wc, tunnel.ipv6_src);
+        WC_MASK_FIELD(wc, tunnel.ipv6_dst);
         WC_MASK_FIELD(wc, tunnel.flags);
         WC_MASK_FIELD(wc, tunnel.ip_tos);
         WC_MASK_FIELD(wc, tunnel.ip_ttl);
@@ -1316,11 +1328,11 @@ void
 flow_wc_map(const struct flow *flow, struct flowmap *map)
 {
     /* Update this function whenever struct flow changes. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
 
     flowmap_init(map);
 
-    if (flow->tunnel.ip_dst) {
+    if (flow_tnl_dst_is_set(&flow->tunnel)) {
         FLOWMAP_SET__(map, tunnel, offsetof(struct flow_tnl, metadata));
         if (!(flow->tunnel.flags & FLOW_TNL_F_UDPIF)) {
             if (flow->tunnel.metadata.present.map) {
@@ -1400,7 +1412,7 @@ void
 flow_wildcards_clear_non_packet_fields(struct flow_wildcards *wc)
 {
     /* Update this function whenever struct flow changes. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
 
     memset(&wc->masks.metadata, 0, sizeof wc->masks.metadata);
     memset(&wc->masks.regs, 0, sizeof wc->masks.regs);
@@ -2027,7 +2039,7 @@ flow_push_mpls(struct flow *flow, int n, ovs_be16 mpls_eth_type,
         flow->mpls_lse[0] = set_mpls_lse_values(ttl, tc, 1, htonl(label));
 
         /* Clear all L3 and L4 fields and dp_hash. */
-        BUILD_ASSERT(FLOW_WC_SEQ == 34);
+        BUILD_ASSERT(FLOW_WC_SEQ == 35);
         memset((char *) flow + FLOW_SEGMENT_2_ENDS_AT, 0,
                sizeof(struct flow) - FLOW_SEGMENT_2_ENDS_AT);
         flow->dp_hash = 0;

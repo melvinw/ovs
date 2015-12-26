@@ -78,7 +78,9 @@ struct ovsdb_idl_arc {
 enum ovsdb_idl_state {
     IDL_S_SCHEMA_REQUESTED,
     IDL_S_MONITOR_REQUESTED,
-    IDL_S_MONITORING
+    IDL_S_MONITORING,
+    IDL_S_MONITOR2_REQUESTED,
+    IDL_S_MONITORING2
 };
 
 struct ovsdb_idl {
@@ -93,6 +95,7 @@ struct ovsdb_idl {
     unsigned int state_seqno;
     enum ovsdb_idl_state state;
     struct json *request_id;
+    struct json *schema;
 
     /* Database locking. */
     char *lock_name;            /* Name of lock we need, NULL if none. */
@@ -133,23 +136,42 @@ struct ovsdb_idl_txn_insert {
     struct uuid real;           /* Real UUID used by database server. */
 };
 
+enum ovsdb_update_version {
+    OVSDB_UPDATE,               /* RFC 7047 "update" method. */
+    OVSDB_UPDATE2               /* "update2" Extension to RFC 7047.
+                                   See ovsdb-server(1) for more information. */
+};
+
+/* Name arrays indexed by 'enum ovsdb_update_version'. */
+static const char *table_updates_names[] = {"table_updates", "table_updates2"};
+static const char *table_update_names[] = {"table_update", "table_update2"};
+static const char *row_update_names[] = {"row_update", "row_update2"};
+
 static struct vlog_rate_limit syntax_rl = VLOG_RATE_LIMIT_INIT(1, 5);
 static struct vlog_rate_limit semantic_rl = VLOG_RATE_LIMIT_INIT(1, 5);
 
 static void ovsdb_idl_clear(struct ovsdb_idl *);
 static void ovsdb_idl_send_schema_request(struct ovsdb_idl *);
-static void ovsdb_idl_send_monitor_request(struct ovsdb_idl *,
-                                           const struct json *schema_json);
-static void ovsdb_idl_parse_update(struct ovsdb_idl *, const struct json *);
+static void ovsdb_idl_send_monitor_request(struct ovsdb_idl *);
+static void ovsdb_idl_send_monitor2_request(struct ovsdb_idl *);
+static void ovsdb_idl_parse_update(struct ovsdb_idl *, const struct json *,
+                                   enum ovsdb_update_version);
 static struct ovsdb_error *ovsdb_idl_parse_update__(struct ovsdb_idl *,
-                                                    const struct json *);
+                                                    const struct json *,
+                                                    enum ovsdb_update_version);
 static bool ovsdb_idl_process_update(struct ovsdb_idl_table *,
                                      const struct uuid *,
                                      const struct json *old,
                                      const struct json *new);
+static bool ovsdb_idl_process_update2(struct ovsdb_idl_table *,
+                                      const struct uuid *,
+                                      const char *operation,
+                                      const struct json *row);
 static void ovsdb_idl_insert_row(struct ovsdb_idl_row *, const struct json *);
 static void ovsdb_idl_delete_row(struct ovsdb_idl_row *);
 static bool ovsdb_idl_modify_row(struct ovsdb_idl_row *, const struct json *);
+static bool ovsdb_idl_modify_row_by_diff(struct ovsdb_idl_row *,
+                                         const struct json *);
 
 static bool ovsdb_idl_row_is_orphan(const struct ovsdb_idl_row *);
 static struct ovsdb_idl_row *ovsdb_idl_row_create__(
@@ -157,11 +179,13 @@ static struct ovsdb_idl_row *ovsdb_idl_row_create__(
 static struct ovsdb_idl_row *ovsdb_idl_row_create(struct ovsdb_idl_table *,
                                                   const struct uuid *);
 static void ovsdb_idl_row_destroy(struct ovsdb_idl_row *);
+static void ovsdb_idl_row_destroy_postprocess(struct ovsdb_idl *);
 
 static void ovsdb_idl_row_parse(struct ovsdb_idl_row *);
 static void ovsdb_idl_row_unparse(struct ovsdb_idl_row *);
 static void ovsdb_idl_row_clear_old(struct ovsdb_idl_row *);
 static void ovsdb_idl_row_clear_new(struct ovsdb_idl_row *);
+static void ovsdb_idl_row_clear_arcs(struct ovsdb_idl_row *, bool destroy_dsts);
 
 static void ovsdb_idl_txn_abort_all(struct ovsdb_idl *);
 static bool ovsdb_idl_txn_process_reply(struct ovsdb_idl *,
@@ -174,6 +198,10 @@ static void ovsdb_idl_parse_lock_reply(struct ovsdb_idl *,
 static void ovsdb_idl_parse_lock_notify(struct ovsdb_idl *,
                                         const struct json *params,
                                         bool new_has_lock);
+static struct ovsdb_idl_table *
+ovsdb_idl_table_from_class(const struct ovsdb_idl *,
+                           const struct ovsdb_idl_table_class *);
+static bool ovsdb_idl_track_is_set(struct ovsdb_idl_table *table);
 
 /* Creates and returns a connection to database 'remote', which should be in a
  * form acceptable to jsonrpc_session_open().  The connection will maintain an
@@ -227,11 +255,16 @@ ovsdb_idl_create(const char *remote, const struct ovsdb_idl_class *class,
             shash_add_assert(&table->columns, column->name, column);
         }
         hmap_init(&table->rows);
+        list_init(&table->track_list);
+        table->change_seqno[OVSDB_IDL_CHANGE_INSERT]
+            = table->change_seqno[OVSDB_IDL_CHANGE_MODIFY]
+            = table->change_seqno[OVSDB_IDL_CHANGE_DELETE] = 0;
         table->idl = idl;
     }
 
     idl->state_seqno = UINT_MAX;
     idl->request_id = NULL;
+    idl->schema = NULL;
 
     hmap_init(&idl->outstanding_txns);
 
@@ -260,6 +293,7 @@ ovsdb_idl_destroy(struct ovsdb_idl *idl)
         json_destroy(idl->request_id);
         free(idl->lock_name);
         json_destroy(idl->lock_request_id);
+        json_destroy(idl->schema);
         hmap_destroy(&idl->outstanding_txns);
         free(idl);
     }
@@ -292,9 +326,15 @@ ovsdb_idl_clear(struct ovsdb_idl *idl)
             /* No need to do anything with dst_arcs: some node has those arcs
              * as forward arcs and will destroy them itself. */
 
+            if (!list_is_empty(&row->track_node)) {
+                list_remove(&row->track_node);
+            }
+
             ovsdb_idl_row_destroy(row);
         }
     }
+
+    ovsdb_idl_track_clear(idl);
 
     if (changed) {
         idl->change_seqno++;
@@ -335,38 +375,59 @@ ovsdb_idl_run(struct ovsdb_idl *idl)
         }
 
         if (msg->type == JSONRPC_NOTIFY
+            && !strcmp(msg->method, "update2")
+            && msg->params->type == JSON_ARRAY
+            && msg->params->u.array.n == 2
+            && msg->params->u.array.elems[0]->type == JSON_NULL) {
+            /* Database contents changed. */
+            ovsdb_idl_parse_update(idl, msg->params->u.array.elems[1],
+                                   OVSDB_UPDATE2);
+        } else if (msg->type == JSONRPC_REPLY
+                   && idl->request_id
+                   && json_equal(idl->request_id, msg->id)) {
+            json_destroy(idl->request_id);
+            idl->request_id = NULL;
+
+            switch (idl->state) {
+            case IDL_S_SCHEMA_REQUESTED:
+                /* Reply to our "get_schema" request. */
+                idl->schema = json_clone(msg->result);
+                ovsdb_idl_send_monitor2_request(idl);
+                idl->state = IDL_S_MONITOR2_REQUESTED;
+                break;
+
+            case IDL_S_MONITOR_REQUESTED:
+            case IDL_S_MONITOR2_REQUESTED:
+                /* Reply to our "monitor" or "monitor2" request. */
+                idl->change_seqno++;
+                ovsdb_idl_clear(idl);
+                if (idl->state == IDL_S_MONITOR_REQUESTED) {
+                    idl->state = IDL_S_MONITORING;
+                    ovsdb_idl_parse_update(idl, msg->result, OVSDB_UPDATE);
+                } else { /* IDL_S_MONITOR2_REQUESTED. */
+                    idl->state = IDL_S_MONITORING2;
+                    ovsdb_idl_parse_update(idl, msg->result, OVSDB_UPDATE2);
+                }
+
+                /* Schema is not useful after monitor request is accepted
+                 * by the server.  */
+                json_destroy(idl->schema);
+                idl->schema = NULL;
+                break;
+
+            case IDL_S_MONITORING:
+            case IDL_S_MONITORING2:
+            default:
+                OVS_NOT_REACHED();
+            }
+        } else if (msg->type == JSONRPC_NOTIFY
             && !strcmp(msg->method, "update")
             && msg->params->type == JSON_ARRAY
             && msg->params->u.array.n == 2
             && msg->params->u.array.elems[0]->type == JSON_NULL) {
             /* Database contents changed. */
-            ovsdb_idl_parse_update(idl, msg->params->u.array.elems[1]);
-        } else if (msg->type == JSONRPC_REPLY
-                   && idl->request_id
-                   && json_equal(idl->request_id, msg->id)) {
-            switch (idl->state) {
-            case IDL_S_SCHEMA_REQUESTED:
-                /* Reply to our "get_schema" request. */
-                json_destroy(idl->request_id);
-                idl->request_id = NULL;
-                ovsdb_idl_send_monitor_request(idl, msg->result);
-                idl->state = IDL_S_MONITOR_REQUESTED;
-                break;
-
-            case IDL_S_MONITOR_REQUESTED:
-                /* Reply to our "monitor" request. */
-                idl->change_seqno++;
-                json_destroy(idl->request_id);
-                idl->request_id = NULL;
-                idl->state = IDL_S_MONITORING;
-                ovsdb_idl_clear(idl);
-                ovsdb_idl_parse_update(idl, msg->result);
-                break;
-
-            case IDL_S_MONITORING:
-            default:
-                OVS_NOT_REACHED();
-            }
+            ovsdb_idl_parse_update(idl, msg->params->u.array.elems[1],
+                                   OVSDB_UPDATE);
         } else if (msg->type == JSONRPC_REPLY
                    && idl->lock_request_id
                    && json_equal(idl->lock_request_id, msg->id)) {
@@ -380,6 +441,18 @@ ovsdb_idl_run(struct ovsdb_idl *idl)
                    && !strcmp(msg->method, "stolen")) {
             /* Someone else stole our lock. */
             ovsdb_idl_parse_lock_notify(idl, msg->params, false);
+        } else if (msg->type == JSONRPC_ERROR
+                   && idl->state == IDL_S_MONITOR2_REQUESTED
+                   && idl->request_id
+                   && json_equal(idl->request_id, msg->id)) {
+            if (msg->error && !strcmp(json_string(msg->error),
+                                      "unknown method")) {
+                /* Fall back to using "monitor" method.  */
+                json_destroy(idl->request_id);
+                idl->request_id = NULL;
+                ovsdb_idl_send_monitor_request(idl);
+                idl->state = IDL_S_MONITOR_REQUESTED;
+            }
         } else if ((msg->type == JSONRPC_ERROR
                     || msg->type == JSONRPC_REPLY)
                    && ovsdb_idl_txn_process_reply(idl, msg)) {
@@ -394,6 +467,7 @@ ovsdb_idl_run(struct ovsdb_idl *idl)
         }
         jsonrpc_msg_destroy(msg);
     }
+    ovsdb_idl_row_destroy_postprocess(idl);
 }
 
 /* Arranges for poll_block() to wake up when ovsdb_idl_run() has something to
@@ -540,11 +614,13 @@ ovsdb_idl_add_column(struct ovsdb_idl *idl,
 }
 
 /* Ensures that the table with class 'tc' will be replicated on 'idl' even if
- * no columns are selected for replication.  This can be useful because it
- * allows 'idl' to keep track of what rows in the table actually exist, which
- * in turn allows columns that reference the table to have accurate contents.
- * (The IDL presents the database with references to rows that do not exist
- * removed.)
+ * no columns are selected for replication. Just the necessary data for table
+ * references will be replicated (the UUID of the rows, for instance), any
+ * columns not selected for replication will remain unreplicated.
+ * This can be useful because it allows 'idl' to keep track of what rows in the
+ * table actually exist, which in turn allows columns that reference the table
+ * to have accurate contents. (The IDL presents the database with references to
+ * rows that do not exist removed.)
  *
  * This function is only useful if 'monitor_everything_by_default' was false in
  * the call to ovsdb_idl_create().  This function should be called between
@@ -591,6 +667,142 @@ ovsdb_idl_omit(struct ovsdb_idl *idl, const struct ovsdb_idl_column *column)
 {
     *ovsdb_idl_get_mode(idl, column) = 0;
 }
+
+/* Returns the most recent IDL change sequence number that caused a
+ * insert, modify or delete update to the table with class 'table_class'.
+ */
+unsigned int
+ovsdb_idl_table_get_seqno(const struct ovsdb_idl *idl,
+                          const struct ovsdb_idl_table_class *table_class)
+{
+    struct ovsdb_idl_table *table
+        = ovsdb_idl_table_from_class(idl, table_class);
+    unsigned int max_seqno = table->change_seqno[OVSDB_IDL_CHANGE_INSERT];
+
+    if (max_seqno < table->change_seqno[OVSDB_IDL_CHANGE_MODIFY]) {
+        max_seqno = table->change_seqno[OVSDB_IDL_CHANGE_MODIFY];
+    }
+    if (max_seqno < table->change_seqno[OVSDB_IDL_CHANGE_DELETE]) {
+        max_seqno = table->change_seqno[OVSDB_IDL_CHANGE_DELETE];
+    }
+    return max_seqno;
+}
+
+/* For each row that contains tracked columns, IDL stores the most
+ * recent IDL change sequence numbers associateed with insert, modify
+ * and delete updates to the table.
+ */
+unsigned int
+ovsdb_idl_row_get_seqno(const struct ovsdb_idl_row *row,
+                        enum ovsdb_idl_change change)
+{
+    return row->change_seqno[change];
+}
+
+/* Turns on OVSDB_IDL_TRACK for 'column' in 'idl', ensuring that
+ * all rows whose 'column' is modified are traced. Similarly, insert
+ * or delete of rows having 'column' are tracked. Clients are able
+ * to retrive the tracked rows with the ovsdb_idl_track_get_*()
+ * functions.
+ *
+ * This function should be called between ovsdb_idl_create() and
+ * the first call to ovsdb_idl_run(). The column to be tracked
+ * should have OVSDB_IDL_ALERT turned on.
+ */
+void
+ovsdb_idl_track_add_column(struct ovsdb_idl *idl,
+                           const struct ovsdb_idl_column *column)
+{
+    if (!(*ovsdb_idl_get_mode(idl, column) & OVSDB_IDL_ALERT)) {
+        ovsdb_idl_add_column(idl, column);
+    }
+    *ovsdb_idl_get_mode(idl, column) |= OVSDB_IDL_TRACK;
+}
+
+void
+ovsdb_idl_track_add_all(struct ovsdb_idl *idl)
+{
+    size_t i, j;
+
+    for (i = 0; i < idl->class->n_tables; i++) {
+        const struct ovsdb_idl_table_class *tc = &idl->class->tables[i];
+
+        for (j = 0; j < tc->n_columns; j++) {
+            const struct ovsdb_idl_column *column = &tc->columns[j];
+            ovsdb_idl_track_add_column(idl, column);
+        }
+    }
+}
+
+/* Returns true if 'table' has any tracked column. */
+static bool
+ovsdb_idl_track_is_set(struct ovsdb_idl_table *table)
+{
+    size_t i;
+
+    for (i = 0; i < table->class->n_columns; i++) {
+        if (table->modes[i] & OVSDB_IDL_TRACK) {
+            return true;
+        }
+    }
+   return false;
+}
+
+/* Returns the first tracked row in table with class 'table_class'
+ * for the specified 'idl'. Returns NULL if there are no tracked rows */
+const struct ovsdb_idl_row *
+ovsdb_idl_track_get_first(const struct ovsdb_idl *idl,
+                          const struct ovsdb_idl_table_class *table_class)
+{
+    struct ovsdb_idl_table *table
+        = ovsdb_idl_table_from_class(idl, table_class);
+
+    if (!list_is_empty(&table->track_list)) {
+        return CONTAINER_OF(list_front(&table->track_list), struct ovsdb_idl_row, track_node);
+    }
+    return NULL;
+}
+
+/* Returns the next tracked row in table after the specified 'row'
+ * (in no particular order). Returns NULL if there are no tracked rows */
+const struct ovsdb_idl_row *
+ovsdb_idl_track_get_next(const struct ovsdb_idl_row *row)
+{
+    if (row->track_node.next != &row->table->track_list) {
+        return CONTAINER_OF(row->track_node.next, struct ovsdb_idl_row, track_node);
+    }
+
+    return NULL;
+}
+
+/* Flushes the tracked rows. Client calls this function after calling
+ * ovsdb_idl_run() and read all tracked rows with the ovsdb_idl_track_get_*()
+ * functions. This is usually done at the end of the client's processing
+ * loop when it is ready to do ovsdb_idl_run() again.
+ */
+void
+ovsdb_idl_track_clear(const struct ovsdb_idl *idl)
+{
+    size_t i;
+
+    for (i = 0; i < idl->class->n_tables; i++) {
+        struct ovsdb_idl_table *table = &idl->tables[i];
+
+        if (!list_is_empty(&table->track_list)) {
+            struct ovsdb_idl_row *row, *next;
+
+            LIST_FOR_EACH_SAFE(row, next, track_node, &table->track_list) {
+                list_remove(&row->track_node);
+                list_init(&row->track_node);
+                if (ovsdb_idl_row_is_orphan(row)) {
+                    ovsdb_idl_row_clear_old(row);
+                    free(row);
+                }
+            }
+        }
+    }
+}
+
 
 static void
 ovsdb_idl_send_schema_request(struct ovsdb_idl *idl)
@@ -690,14 +902,15 @@ parse_schema(const struct json *schema_json)
 }
 
 static void
-ovsdb_idl_send_monitor_request(struct ovsdb_idl *idl,
-                               const struct json *schema_json)
+ovsdb_idl_send_monitor_request__(struct ovsdb_idl *idl,
+                                 const char *method)
 {
-    struct shash *schema = parse_schema(schema_json);
+    struct shash *schema;
     struct json *monitor_requests;
     struct jsonrpc_msg *msg;
     size_t i;
 
+    schema = parse_schema(idl->schema);
     monitor_requests = json_object_create();
     for (i = 0; i < idl->class->n_tables; i++) {
         const struct ovsdb_idl_table *table = &idl->tables[i];
@@ -747,7 +960,7 @@ ovsdb_idl_send_monitor_request(struct ovsdb_idl *idl,
 
     json_destroy(idl->request_id);
     msg = jsonrpc_create_request(
-        "monitor",
+        method,
         json_array_create_3(json_string_create(idl->class->database),
                             json_null_create(), monitor_requests),
         &idl->request_id);
@@ -755,29 +968,55 @@ ovsdb_idl_send_monitor_request(struct ovsdb_idl *idl,
 }
 
 static void
-ovsdb_idl_parse_update(struct ovsdb_idl *idl, const struct json *table_updates)
+ovsdb_idl_send_monitor_request(struct ovsdb_idl *idl)
 {
-    struct ovsdb_error *error = ovsdb_idl_parse_update__(idl, table_updates);
-    if (error) {
+    ovsdb_idl_send_monitor_request__(idl, "monitor");
+}
+
+static void
+log_parse_update_error(struct ovsdb_error *error)
+{
         if (!VLOG_DROP_WARN(&syntax_rl)) {
             char *s = ovsdb_error_to_string(error);
             VLOG_WARN_RL(&syntax_rl, "%s", s);
             free(s);
         }
         ovsdb_error_destroy(error);
+}
+
+static void
+ovsdb_idl_send_monitor2_request(struct ovsdb_idl *idl)
+{
+    ovsdb_idl_send_monitor_request__(idl, "monitor2");
+}
+
+static void
+ovsdb_idl_parse_update(struct ovsdb_idl *idl, const struct json *table_updates,
+                       enum ovsdb_update_version version)
+{
+    struct ovsdb_error *error = ovsdb_idl_parse_update__(idl, table_updates,
+                                                         version);
+    if (error) {
+        log_parse_update_error(error);
     }
 }
 
 static struct ovsdb_error *
 ovsdb_idl_parse_update__(struct ovsdb_idl *idl,
-                         const struct json *table_updates)
+                         const struct json *table_updates,
+                         enum ovsdb_update_version version)
 {
     const struct shash_node *tables_node;
+    const char *table_updates_name = table_updates_names[version];
+    const char *table_update_name = table_update_names[version];
+    const char *row_update_name = row_update_names[version];
 
     if (table_updates->type != JSON_OBJECT) {
         return ovsdb_syntax_error(table_updates, NULL,
-                                  "<table-updates> is not an object");
+                                  "<%s> is not an object",
+                                  table_updates_name);
     }
+
     SHASH_FOR_EACH (tables_node, json_object(table_updates)) {
         const struct json *table_update = tables_node->data;
         const struct shash_node *table_node;
@@ -787,14 +1026,17 @@ ovsdb_idl_parse_update__(struct ovsdb_idl *idl,
         if (!table) {
             return ovsdb_syntax_error(
                 table_updates, NULL,
-                "<table-updates> includes unknown table \"%s\"",
+                "<%s> includes unknown table \"%s\"",
+                table_updates_name,
                 tables_node->name);
         }
 
         if (table_update->type != JSON_OBJECT) {
             return ovsdb_syntax_error(table_update, NULL,
-                                      "<table-update> for table \"%s\" is "
-                                      "not an object", table->class->name);
+                                      "<%s> for table \"%s\" is "
+                                      "not an object",
+                                      table_update_name,
+                                      table->class->name);
         }
         SHASH_FOR_EACH (table_node, json_object(table_update)) {
             const struct json *row_update = table_node->data;
@@ -803,42 +1045,81 @@ ovsdb_idl_parse_update__(struct ovsdb_idl *idl,
 
             if (!uuid_from_string(&uuid, table_node->name)) {
                 return ovsdb_syntax_error(table_update, NULL,
-                                          "<table-update> for table \"%s\" "
+                                          "<%s> for table \"%s\" "
                                           "contains bad UUID "
                                           "\"%s\" as member name",
+                                          table_update_name,
                                           table->class->name,
                                           table_node->name);
             }
             if (row_update->type != JSON_OBJECT) {
                 return ovsdb_syntax_error(row_update, NULL,
-                                          "<table-update> for table \"%s\" "
-                                          "contains <row-update> for %s that "
+                                          "<%s> for table \"%s\" "
+                                          "contains <%s> for %s that "
                                           "is not an object",
+                                          table_update_name,
                                           table->class->name,
+                                          row_update_name,
                                           table_node->name);
             }
 
-            old_json = shash_find_data(json_object(row_update), "old");
-            new_json = shash_find_data(json_object(row_update), "new");
-            if (old_json && old_json->type != JSON_OBJECT) {
-                return ovsdb_syntax_error(old_json, NULL,
-                                          "\"old\" <row> is not object");
-            } else if (new_json && new_json->type != JSON_OBJECT) {
-                return ovsdb_syntax_error(new_json, NULL,
-                                          "\"new\" <row> is not object");
-            } else if ((old_json != NULL) + (new_json != NULL)
-                       != shash_count(json_object(row_update))) {
-                return ovsdb_syntax_error(row_update, NULL,
-                                          "<row-update> contains unexpected "
-                                          "member");
-            } else if (!old_json && !new_json) {
-                return ovsdb_syntax_error(row_update, NULL,
-                                          "<row-update> missing \"old\" "
-                                          "and \"new\" members");
+            switch(version) {
+            case OVSDB_UPDATE:
+                old_json = shash_find_data(json_object(row_update), "old");
+                new_json = shash_find_data(json_object(row_update), "new");
+                if (old_json && old_json->type != JSON_OBJECT) {
+                    return ovsdb_syntax_error(old_json, NULL,
+                                              "\"old\" <row> is not object");
+                } else if (new_json && new_json->type != JSON_OBJECT) {
+                    return ovsdb_syntax_error(new_json, NULL,
+                                              "\"new\" <row> is not object");
+                } else if ((old_json != NULL) + (new_json != NULL)
+                           != shash_count(json_object(row_update))) {
+                    return ovsdb_syntax_error(row_update, NULL,
+                                              "<row-update> contains "
+                                              "unexpected member");
+                } else if (!old_json && !new_json) {
+                    return ovsdb_syntax_error(row_update, NULL,
+                                              "<row-update> missing \"old\" "
+                                              "and \"new\" members");
+                }
+
+                if (ovsdb_idl_process_update(table, &uuid, old_json,
+                                             new_json)) {
+                    idl->change_seqno++;
+                }
+                break;
+
+            case OVSDB_UPDATE2: {
+                const char *ops[] = {"modify", "insert", "delete", "initial"};
+                const char *operation;
+                const struct json *row;
+                int i;
+
+                for (i = 0; i < ARRAY_SIZE(ops); i++) {
+                    operation = ops[i];
+                    row = shash_find_data(json_object(row_update), operation);
+
+                    if (row)  {
+                        if (ovsdb_idl_process_update2(table, &uuid, operation,
+                                                      row)) {
+                            idl->change_seqno++;
+                        }
+                        break;
+                    }
+                }
+
+                /* row_update2 should contain one of the objects */
+                if (i == ARRAY_SIZE(ops)) {
+                    return ovsdb_syntax_error(row_update, NULL,
+                                              "<row_update2> includes unknown "
+                                              "object");
+                }
+                break;
             }
 
-            if (ovsdb_idl_process_update(table, &uuid, old_json, new_json)) {
-                idl->change_seqno++;
+            default:
+                OVS_NOT_REACHED();
             }
         }
     }
@@ -916,16 +1197,73 @@ ovsdb_idl_process_update(struct ovsdb_idl_table *table,
 /* Returns true if a column with mode OVSDB_IDL_MODE_RW changed, false
  * otherwise. */
 static bool
-ovsdb_idl_row_update(struct ovsdb_idl_row *row, const struct json *row_json)
+ovsdb_idl_process_update2(struct ovsdb_idl_table *table,
+                          const struct uuid *uuid,
+                          const char *operation,
+                          const struct json *json_row)
+{
+    struct ovsdb_idl_row *row;
+
+    row = ovsdb_idl_get_row(table, uuid);
+    if (!strcmp(operation, "delete")) {
+        /* Delete row. */
+        if (row && !ovsdb_idl_row_is_orphan(row)) {
+            ovsdb_idl_delete_row(row);
+        } else {
+            VLOG_WARN_RL(&semantic_rl, "cannot delete missing row "UUID_FMT" "
+                         "from table %s",
+                         UUID_ARGS(uuid), table->class->name);
+            return false;
+        }
+    } else if (!strcmp(operation, "insert") || !strcmp(operation, "initial")) {
+        /* Insert row. */
+        if (!row) {
+            ovsdb_idl_insert_row(ovsdb_idl_row_create(table, uuid), json_row);
+        } else if (ovsdb_idl_row_is_orphan(row)) {
+            ovsdb_idl_insert_row(row, json_row);
+        } else {
+            VLOG_WARN_RL(&semantic_rl, "cannot add existing row "UUID_FMT" to "
+                         "table %s", UUID_ARGS(uuid), table->class->name);
+            ovsdb_idl_delete_row(row);
+            ovsdb_idl_insert_row(row, json_row);
+        }
+    } else if (!strcmp(operation, "modify")) {
+        /* Modify row. */
+        if (row) {
+            if (!ovsdb_idl_row_is_orphan(row)) {
+                return ovsdb_idl_modify_row_by_diff(row, json_row);
+            } else {
+                VLOG_WARN_RL(&semantic_rl, "cannot modify missing but "
+                             "referenced row "UUID_FMT" in table %s",
+                             UUID_ARGS(uuid), table->class->name);
+                return false;
+            }
+        } else {
+            VLOG_WARN_RL(&semantic_rl, "cannot modify missing row "UUID_FMT" "
+                         "in table %s", UUID_ARGS(uuid), table->class->name);
+            return false;
+        }
+    } else {
+            VLOG_WARN_RL(&semantic_rl, "unknown operation %s to "
+                         "table %s", operation, table->class->name);
+            return false;
+    }
+
+    return true;
+}
+
+#if 0
+ovsdb_idl_row_apply_diff(struct ovsdb_idl_row *row,
+                         const struct json *diff_json)
 {
     struct ovsdb_idl_table *table = row->table;
     struct shash_node *node;
     bool changed = false;
 
-    SHASH_FOR_EACH (node, json_object(row_json)) {
+    SHASH_FOR_EACH (node, json_object(diff_json)) {
         const char *column_name = node->name;
         const struct ovsdb_idl_column *column;
-        struct ovsdb_datum datum;
+        struct ovsdb_datum diff;
         struct ovsdb_error *error;
 
         column = shash_find_data(&table->columns, column_name);
@@ -935,15 +1273,108 @@ ovsdb_idl_row_update(struct ovsdb_idl_row *row, const struct json *row_json)
             continue;
         }
 
-        error = ovsdb_datum_from_json(&datum, &column->type, node->data, NULL);
+        error = ovsdb_transient_datum_from_json(&diff, &column->type,
+                                                node->data);
         if (!error) {
             unsigned int column_idx = column - table->class->columns;
             struct ovsdb_datum *old = &row->old[column_idx];
+            struct ovsdb_datum new;
+            struct ovsdb_error *error;
 
+            error = ovsdb_datum_apply_diff(&new, old, &diff, &column->type);
+            if (error) {
+                VLOG_WARN_RL(&syntax_rl, "update2 failed to modify column "
+                             "%s row "UUID_FMT, column_name,
+                             UUID_ARGS(&row->uuid));
+                ovsdb_error_destroy(error);
+            } else {
+                ovsdb_datum_swap(old, &new);
+                ovsdb_datum_destroy(&new, &column->type);
+                if (table->modes[column_idx] & OVSDB_IDL_ALERT) {
+                    changed = true;
+                }
+            }
+            ovsdb_datum_destroy(&diff, &column->type);
+        } else {
+            char *s = ovsdb_error_to_string(error);
+            VLOG_WARN_RL(&syntax_rl, "error parsing column %s in row "UUID_FMT
+                         " in table %s: %s", column_name,
+                         UUID_ARGS(&row->uuid), table->class->name, s);
+            free(s);
+            ovsdb_error_destroy(error);
+        }
+    }
+    return changed;
+}
+#endif
+
+/* Returns true if a column with mode OVSDB_IDL_MODE_RW changed, false
+ * otherwise.
+ *
+ * Change 'row' either with the content of 'row_json' or by apply 'diff'.
+ * Caller needs to provide either valid 'row_json' or 'diff', but not
+ * both.  */
+static bool
+ovsdb_idl_row_change__(struct ovsdb_idl_row *row, const struct json *row_json,
+                       const struct json *diff_json,
+                       enum ovsdb_idl_change change)
+{
+    struct ovsdb_idl_table *table = row->table;
+    struct shash_node *node;
+    bool changed = false;
+    bool apply_diff = diff_json != NULL;
+    const struct json *json = apply_diff ? diff_json : row_json;
+
+    SHASH_FOR_EACH (node, json_object(json)) {
+        const char *column_name = node->name;
+        const struct ovsdb_idl_column *column;
+        struct ovsdb_datum datum;
+        struct ovsdb_error *error;
+        unsigned int column_idx;
+        struct ovsdb_datum *old;
+
+        column = shash_find_data(&table->columns, column_name);
+        if (!column) {
+            VLOG_WARN_RL(&syntax_rl, "unknown column %s updating row "UUID_FMT,
+                         column_name, UUID_ARGS(&row->uuid));
+            continue;
+        }
+
+        column_idx = column - table->class->columns;
+        old = &row->old[column_idx];
+
+        error = NULL;
+        if (apply_diff) {
+            struct ovsdb_datum diff;
+
+            ovs_assert(!row_json);
+            error = ovsdb_transient_datum_from_json(&diff, &column->type,
+                                                    node->data);
+            if (!error) {
+                error = ovsdb_datum_apply_diff(&datum, old, &diff,
+                                               &column->type);
+                ovsdb_datum_destroy(&diff, &column->type);
+            }
+        } else {
+            ovs_assert(!diff_json);
+            error = ovsdb_datum_from_json(&datum, &column->type, node->data,
+                                          NULL);
+        }
+
+        if (!error) {
             if (!ovsdb_datum_equals(old, &datum, &column->type)) {
                 ovsdb_datum_swap(old, &datum);
                 if (table->modes[column_idx] & OVSDB_IDL_ALERT) {
                     changed = true;
+                    row->change_seqno[change]
+                        = row->table->change_seqno[change]
+                        = row->table->idl->change_seqno + 1;
+                    if (table->modes[column_idx] & OVSDB_IDL_TRACK) {
+                        if (list_is_empty(&row->track_node)) {
+                            list_push_front(&row->table->track_list,
+                                            &row->track_node);
+                        }
+                    }
                 }
             } else {
                 /* Didn't really change but the OVSDB monitor protocol always
@@ -961,6 +1392,21 @@ ovsdb_idl_row_update(struct ovsdb_idl_row *row, const struct json *row_json)
         }
     }
     return changed;
+}
+
+static bool
+ovsdb_idl_row_update(struct ovsdb_idl_row *row, const struct json *row_json,
+                     enum ovsdb_idl_change change)
+{
+    return ovsdb_idl_row_change__(row, row_json, NULL, change);
+}
+
+static bool
+ovsdb_idl_row_apply_diff(struct ovsdb_idl_row *row,
+                         const struct json *diff_json,
+                         enum ovsdb_idl_change change)
+{
+    return ovsdb_idl_row_change__(row, NULL, diff_json, change);
 }
 
 /* When a row A refers to row B through a column with a "refTable" constraint,
@@ -1067,7 +1513,10 @@ ovsdb_idl_row_clear_arcs(struct ovsdb_idl_row *row, bool destroy_dsts)
     struct ovsdb_idl_arc *arc, *next;
 
     /* Delete all forward arcs.  If 'destroy_dsts', destroy any orphaned rows
-     * that this causes to be unreferenced. */
+     * that this causes to be unreferenced, if tracking is not enabled.
+     * If tracking is enabled, orphaned nodes are removed from hmap but not
+     * freed.
+     */
     LIST_FOR_EACH_SAFE (arc, next, src_node, &row->src_arcs) {
         list_remove(&arc->dst_node);
         if (destroy_dsts
@@ -1113,6 +1562,7 @@ ovsdb_idl_row_create__(const struct ovsdb_idl_table_class *class)
     list_init(&row->src_arcs);
     list_init(&row->dst_arcs);
     hmap_node_nullify(&row->txn_node);
+    list_init(&row->track_node);
     return row;
 }
 
@@ -1132,7 +1582,35 @@ ovsdb_idl_row_destroy(struct ovsdb_idl_row *row)
     if (row) {
         ovsdb_idl_row_clear_old(row);
         hmap_remove(&row->table->rows, &row->hmap_node);
-        free(row);
+        if (ovsdb_idl_track_is_set(row->table)) {
+            row->change_seqno[OVSDB_IDL_CHANGE_DELETE]
+                = row->table->change_seqno[OVSDB_IDL_CHANGE_DELETE]
+                = row->table->idl->change_seqno + 1;
+        }
+        if (list_is_empty(&row->track_node)) {
+            list_push_front(&row->table->track_list, &row->track_node);
+        }
+    }
+}
+
+static void
+ovsdb_idl_row_destroy_postprocess(struct ovsdb_idl *idl)
+{
+    size_t i;
+
+    for (i = 0; i < idl->class->n_tables; i++) {
+        struct ovsdb_idl_table *table = &idl->tables[i];
+
+        if (!list_is_empty(&table->track_list)) {
+            struct ovsdb_idl_row *row, *next;
+
+            LIST_FOR_EACH_SAFE(row, next, track_node, &table->track_list) {
+                if (!ovsdb_idl_track_is_set(row->table)) {
+                    list_remove(&row->track_node);
+                    free(row);
+                }
+            }
+        }
     }
 }
 
@@ -1147,7 +1625,7 @@ ovsdb_idl_insert_row(struct ovsdb_idl_row *row, const struct json *row_json)
     for (i = 0; i < class->n_columns; i++) {
         ovsdb_datum_init_default(&row->old[i], &class->columns[i].type);
     }
-    ovsdb_idl_row_update(row, row_json);
+    ovsdb_idl_row_update(row, row_json, OVSDB_IDL_CHANGE_INSERT);
     ovsdb_idl_row_parse(row);
 
     ovsdb_idl_row_reparse_backrefs(row);
@@ -1175,7 +1653,22 @@ ovsdb_idl_modify_row(struct ovsdb_idl_row *row, const struct json *row_json)
 
     ovsdb_idl_row_unparse(row);
     ovsdb_idl_row_clear_arcs(row, true);
-    changed = ovsdb_idl_row_update(row, row_json);
+    changed = ovsdb_idl_row_update(row, row_json, OVSDB_IDL_CHANGE_MODIFY);
+    ovsdb_idl_row_parse(row);
+
+    return changed;
+}
+
+static bool
+ovsdb_idl_modify_row_by_diff(struct ovsdb_idl_row *row,
+                             const struct json *diff_json)
+{
+    bool changed;
+
+    ovsdb_idl_row_unparse(row);
+    ovsdb_idl_row_clear_arcs(row, true);
+    changed = ovsdb_idl_row_apply_diff(row, diff_json,
+                                       OVSDB_IDL_CHANGE_MODIFY);
     ovsdb_idl_row_parse(row);
 
     return changed;
@@ -2563,7 +3056,8 @@ static void
 ovsdb_idl_update_has_lock(struct ovsdb_idl *idl, bool new_has_lock)
 {
     if (new_has_lock && !idl->has_lock) {
-        if (idl->state == IDL_S_MONITORING) {
+        if (idl->state == IDL_S_MONITORING ||
+            idl->state == IDL_S_MONITORING2) {
             idl->change_seqno++;
         } else {
             /* We're setting up a session, so don't signal that the database

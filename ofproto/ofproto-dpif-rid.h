@@ -93,7 +93,7 @@ struct rule;
 /* Metadata for restoring pipeline context after recirculation.  Helpers
  * are inlined below to keep them together with the definition for easier
  * updates. */
-BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
 
 struct recirc_metadata {
     /* Metadata in struct flow. */
@@ -120,7 +120,7 @@ static inline void
 recirc_metadata_to_flow(const struct recirc_metadata *md,
                         struct flow *flow)
 {
-    if (md->tunnel && md->tunnel->ip_dst) {
+    if (md->tunnel && flow_tnl_dst_is_set(md->tunnel)) {
         flow->tunnel = *md->tunnel;
     } else {
         memset(&flow->tunnel, 0, sizeof flow->tunnel);
@@ -195,5 +195,68 @@ static inline bool recirc_id_node_try_ref_rcu(const struct recirc_id_node *n_)
 void recirc_id_node_unref(const struct recirc_id_node *);
 
 void recirc_run(void);
+
+/* Recirculation IDs on which references are held. */
+struct recirc_refs {
+    unsigned n_recircs;
+    union {
+        uint32_t recirc[2];   /* When n_recircs == 1 or 2 */
+        uint32_t *recircs;    /* When 'n_recircs' > 2 */
+    };
+};
+
+#define RECIRC_REFS_EMPTY_INITIALIZER ((struct recirc_refs) \
+                                       { 0, { { 0, 0 } } })
+/* Helpers to abstract the recirculation union away. */
+static inline void
+recirc_refs_init(struct recirc_refs *rr)
+{
+    *rr = RECIRC_REFS_EMPTY_INITIALIZER;
+}
+
+static inline void
+recirc_refs_add(struct recirc_refs *rr, uint32_t id)
+{
+    if (OVS_LIKELY(rr->n_recircs < ARRAY_SIZE(rr->recirc))) {
+        rr->recirc[rr->n_recircs++] = id;
+    } else {
+        if (rr->n_recircs == ARRAY_SIZE(rr->recirc)) {
+            uint32_t *recircs = xmalloc(sizeof rr->recirc + sizeof id);
+
+            memcpy(recircs, rr->recirc, sizeof rr->recirc);
+            rr->recircs = recircs;
+        } else {
+            rr->recircs = xrealloc(rr->recircs,
+                                   (rr->n_recircs + 1) * sizeof id);
+        }
+        rr->recircs[rr->n_recircs++] = id;
+    }
+}
+
+static inline void
+recirc_refs_swap(struct recirc_refs *a, struct recirc_refs *b)
+{
+    struct recirc_refs tmp;
+
+    tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+static inline void
+recirc_refs_unref(struct recirc_refs *rr)
+{
+    if (OVS_LIKELY(rr->n_recircs <= ARRAY_SIZE(rr->recirc))) {
+        for (int i = 0; i < rr->n_recircs; i++) {
+            recirc_free_id(rr->recirc[i]);
+        }
+    } else {
+        for (int i = 0; i < rr->n_recircs; i++) {
+            recirc_free_id(rr->recircs[i]);
+        }
+        free(rr->recircs);
+    }
+    rr->n_recircs = 0;
+}
 
 #endif

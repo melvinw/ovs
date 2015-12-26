@@ -204,6 +204,24 @@
 
     <ul>
       <li>
+        Priority-150 flows that matches ARP requests to each known IP address
+        <var>A</var> of logical port <var>P</var>, and respond ARP replies
+        directly with corresponding Ethernet address <var>E</var>:
+        <pre>
+eth.dst = eth.src;
+eth.src = <var>E</var>;
+arp.op = 2; /* ARP reply. */
+arp.tha = arp.sha;
+arp.sha = <var>E</var>;
+arp.tpa = arp.spa;
+arp.spa = <var>A</var>;
+outport = <var>P</var>;
+inport = ""; /* Allow sending out inport. */
+output;
+        </pre>
+      </li>
+
+      <li>
         A priority-100 flow that outputs all packets with an Ethernet broadcast
         or multicast <code>eth.dst</code> to the <code>MC_FLOOD</code>
         multicast group, which <code>ovn-northd</code> populates with all
@@ -340,7 +358,7 @@ ip4.dst = ip4.src;
 ip4.src = <var>S</var>;
 ip.ttl = 255;
 icmp4.type = 0;
-inport = \"\"; /* Allow sending out inport. */
+inport = ""; /* Allow sending out inport. */
 next;
         </pre>
 
@@ -370,7 +388,7 @@ arp.sha = <var>E</var>;
 arp.tpa = arp.spa;
 arp.spa = <var>A</var>;
 outport = <var>P</var>;
-inport = \"\"; /* Allow sending out inport. */
+inport = ""; /* Allow sending out inport. */
 output;
         </pre>
       </li>

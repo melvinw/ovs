@@ -99,8 +99,13 @@ typedef union {
     } be64;
 } ovs_be128;
 
-#define OVS_U128_MAX (ovs_u128) { .u64 = { UINT64_MAX, UINT64_MAX } }
-#define OVS_BE128_MAX (ovs_be128) { .be64 = { OVS_BE64_MAX, OVS_BE64_MAX } }
+/* MSVC2015 doesn't support designated initializers when compiling C++,
+ * and doesn't support ternary operators with non-designated initializers.
+ * So we use these static definitions rather than using initializer macros. */
+static const ovs_u128 OVS_U128_MAX = { { UINT32_MAX, UINT32_MAX,
+                                         UINT32_MAX, UINT32_MAX } };
+static const ovs_be128 OVS_BE128_MAX = { { OVS_BE32_MAX, OVS_BE32_MAX,
+                                           OVS_BE32_MAX, OVS_BE32_MAX } };
 
 /* A 64-bit value, in network byte order, that is only aligned on a 32-bit
  * boundary. */
@@ -120,7 +125,7 @@ typedef uint32_t OVS_BITWISE ofp11_port_t;
 #define ODP_PORT_C(X) ((OVS_FORCE odp_port_t) (X))
 #define OFP11_PORT_C(X) ((OVS_FORCE ofp11_port_t) (X))
 
-/* Using this stuct instead of a bare array makes an ethernet address field
+/* Using this struct instead of a bare array makes an ethernet address field
  * assignable.  The size of the array is also part of the type, so it is easier
  * to deal with. */
 struct eth_addr {

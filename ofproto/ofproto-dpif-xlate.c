@@ -22,7 +22,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-#include "tnl-arp-cache.h"
+#include "tnl-neigh-cache.h"
 #include "bfd.h"
 #include "bitmap.h"
 #include "bond.h"
@@ -54,6 +54,7 @@
 #include "ofproto/ofproto-dpif-sflow.h"
 #include "ofproto/ofproto-dpif.h"
 #include "ofproto/ofproto-provider.h"
+#include "packets.h"
 #include "ovs-router.h"
 #include "tnl-ports.h"
 #include "tunnel.h"
@@ -171,7 +172,7 @@ struct xlate_ctx {
      * which might lead to an infinite loop.  This could happen easily
      * if a tunnel is marked as 'ip_remote=flow', and the flow does not
      * actually set the tun_dst field. */
-    ovs_be32 orig_tunnel_ip_dst;
+    struct in6_addr orig_tunnel_ipv6_dst;
 
     /* Stack for the push and pop actions.  Each stack element is of type
      * "union mf_subvalue". */
@@ -305,6 +306,9 @@ struct xlate_ctx {
      * state from the datapath should be honored after recirculation. */
     bool conntracked;
 
+    /* Pointer to an embedded NAT action in a conntrack action, or NULL. */
+    struct ofpact_nat *ct_nat_action;
+
     /* OpenFlow 1.1+ action set.
      *
      * 'action_set' accumulates "struct ofpact"s added by OFPACT_WRITE_ACTIONS.
@@ -313,7 +317,32 @@ struct xlate_ctx {
      * datapath actions. */
     bool action_set_has_group;  /* Action set contains OFPACT_GROUP? */
     struct ofpbuf action_set;   /* Action set. */
+
+    enum xlate_error error;     /* Translation failed. */
 };
+
+const char *xlate_strerror(enum xlate_error error)
+{
+    switch (error) {
+    case XLATE_OK:
+        return "OK";
+    case XLATE_BRIDGE_NOT_FOUND:
+        return "Bridge not found";
+    case XLATE_RECURSION_TOO_DEEP:
+        return "Recursion too deep";
+    case XLATE_TOO_MANY_RESUBMITS:
+        return "Too many resubmits";
+    case XLATE_STACK_TOO_DEEP:
+        return "Stack too deep";
+    case XLATE_NO_RECIRCULATION_CONTEXT:
+        return "No recirculation context";
+    case XLATE_RECIRCULATION_CONFLICT:
+        return "Recirculation conflict";
+    case XLATE_TOO_MANY_MPLS_LABELS:
+        return "Too many MPLS labels";
+    }
+    return "Unknown error";
+}
 
 static void xlate_action_set(struct xlate_ctx *ctx);
 static void xlate_commit_actions(struct xlate_ctx *ctx);
@@ -371,7 +400,7 @@ enum xc_type {
     XC_NORMAL,
     XC_FIN_TIMEOUT,
     XC_GROUP,
-    XC_TNL_ARP,
+    XC_TNL_NEIGH,
 };
 
 /* xlate_cache entries hold enough information to perform the side effects of
@@ -423,8 +452,8 @@ struct xc_entry {
         } group;
         struct {
             char br_name[IFNAMSIZ];
-            ovs_be32 d_ip;
-        } tnl_arp_cache;
+            struct in6_addr d_ipv6;
+        } tnl_neigh_cache;
     } u;
 };
 
@@ -535,6 +564,17 @@ xlate_report(struct xlate_ctx *ctx, const char *format, ...)
         va_end(args);
     }
 }
+
+static struct vlog_rate_limit error_report_rl = VLOG_RATE_LIMIT_INIT(1, 5);
+
+#define XLATE_REPORT_ERROR(CTX, ...)                    \
+    do {                                                \
+        if (OVS_UNLIKELY((CTX)->xin->report_hook)) {    \
+            xlate_report(CTX, __VA_ARGS__);             \
+        } else {                                        \
+            VLOG_ERR_RL(&error_report_rl, __VA_ARGS__); \
+        }                                               \
+    } while (0)
 
 static inline void
 xlate_report_actions(struct xlate_ctx *ctx, const char *title,
@@ -2659,21 +2699,24 @@ process_special(struct xlate_ctx *ctx, const struct xport *xport)
 
 static int
 tnl_route_lookup_flow(const struct flow *oflow,
-                      ovs_be32 *ip, struct xport **out_port)
+                      struct in6_addr *ip, struct xport **out_port)
 {
     char out_dev[IFNAMSIZ];
     struct xbridge *xbridge;
     struct xlate_cfg *xcfg;
-    ovs_be32 gw;
+    struct in6_addr gw;
+    struct in6_addr dst;
 
-    if (!ovs_router_lookup4(oflow->tunnel.ip_dst, out_dev, &gw)) {
+    dst = flow_tnl_dst(&oflow->tunnel);
+    if (!ovs_router_lookup(&dst, out_dev, &gw)) {
         return -ENOENT;
     }
 
-    if (gw) {
+    if (ipv6_addr_is_set(&gw) &&
+        (!IN6_IS_ADDR_V4MAPPED(&gw) || in6_addr_get_mapped_ipv4(&gw))) {
         *ip = gw;
     } else {
-        *ip = oflow->tunnel.ip_dst;
+        *ip = dst;
     }
 
     xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
@@ -2714,6 +2757,19 @@ compose_table_xlate(struct xlate_ctx *ctx, const struct xport *out_dev,
 }
 
 static void
+tnl_send_nd_request(struct xlate_ctx *ctx, const struct xport *out_dev,
+                     const struct eth_addr eth_src,
+                     struct in6_addr * ipv6_src, struct in6_addr * ipv6_dst)
+{
+    struct dp_packet packet;
+
+    dp_packet_init(&packet, 0);
+    compose_nd(&packet, eth_src, ipv6_src, ipv6_dst);
+    compose_table_xlate(ctx, out_dev, &packet);
+    dp_packet_uninit(&packet);
+}
+
+static void
 tnl_send_arp_request(struct xlate_ctx *ctx, const struct xport *out_dev,
                      const struct eth_addr eth_src,
                      ovs_be32 ip_src, ovs_be32 ip_dst)
@@ -2734,18 +2790,24 @@ build_tunnel_send(struct xlate_ctx *ctx, const struct xport *xport,
 {
     struct ovs_action_push_tnl tnl_push_data;
     struct xport *out_dev = NULL;
-    ovs_be32 s_ip, d_ip = 0;
+    ovs_be32 s_ip = 0, d_ip = 0;
+    struct in6_addr s_ip6 = in6addr_any;
+    struct in6_addr d_ip6 = in6addr_any;
     struct eth_addr smac;
     struct eth_addr dmac;
     int err;
+    char buf_sip6[INET6_ADDRSTRLEN];
+    char buf_dip6[INET6_ADDRSTRLEN];
 
-    err = tnl_route_lookup_flow(flow, &d_ip, &out_dev);
+    err = tnl_route_lookup_flow(flow, &d_ip6, &out_dev);
     if (err) {
         xlate_report(ctx, "native tunnel routing failed");
         return err;
     }
-    xlate_report(ctx, "tunneling to "IP_FMT" via %s",
-                 IP_ARGS(d_ip), netdev_get_name(out_dev->netdev));
+
+    xlate_report(ctx, "tunneling to %s via %s",
+                 ipv6_string_mapped(buf_dip6, &d_ip6),
+                 netdev_get_name(out_dev->netdev));
 
     /* Use mac addr of bridge port of the peer. */
     err = netdev_get_etheraddr(out_dev->netdev, &smac);
@@ -2754,35 +2816,51 @@ build_tunnel_send(struct xlate_ctx *ctx, const struct xport *xport,
         return err;
     }
 
-    err = netdev_get_in4(out_dev->netdev, (struct in_addr *) &s_ip, NULL);
+    d_ip = in6_addr_get_mapped_ipv4(&d_ip6);
+    if (d_ip) {
+        err = netdev_get_in4(out_dev->netdev, (struct in_addr *) &s_ip, NULL);
+        if (err) {
+            xlate_report(ctx, "tunnel output device lacks IPv4 address");
+            return err;
+        }
+        in6_addr_set_mapped_ipv4(&s_ip6, s_ip);
+    } else {
+        err = netdev_get_in6(out_dev->netdev, &s_ip6);
+        if (err) {
+            xlate_report(ctx, "tunnel output device lacks IPv6 address");
+            return err;
+        }
+    }
+
+    err = tnl_neigh_lookup(out_dev->xbridge->name, &d_ip6, &dmac);
     if (err) {
-        xlate_report(ctx, "tunnel output device lacks IPv4 address");
+        xlate_report(ctx, "neighbor cache miss for %s on bridge %s, "
+                     "sending %s request",
+                     buf_dip6, out_dev->xbridge->name, d_ip ? "ARP" : "ND");
+        if (d_ip) {
+            tnl_send_arp_request(ctx, out_dev, smac, s_ip, d_ip);
+        } else {
+            tnl_send_nd_request(ctx, out_dev, smac, &s_ip6, &d_ip6);
+        }
         return err;
     }
 
-    err = tnl_arp_lookup(out_dev->xbridge->name, d_ip, &dmac);
-    if (err) {
-        xlate_report(ctx, "ARP cache miss for "IP_FMT" on bridge %s, "
-                     "sending ARP request",
-                     IP_ARGS(d_ip), out_dev->xbridge->name);
-        tnl_send_arp_request(ctx, out_dev, smac, s_ip, d_ip);
-        return err;
-    }
     if (ctx->xin->xcache) {
         struct xc_entry *entry;
 
-        entry = xlate_cache_add_entry(ctx->xin->xcache, XC_TNL_ARP);
-        ovs_strlcpy(entry->u.tnl_arp_cache.br_name, out_dev->xbridge->name,
-                    sizeof entry->u.tnl_arp_cache.br_name);
-        entry->u.tnl_arp_cache.d_ip = d_ip;
+        entry = xlate_cache_add_entry(ctx->xin->xcache, XC_TNL_NEIGH);
+        ovs_strlcpy(entry->u.tnl_neigh_cache.br_name, out_dev->xbridge->name,
+                    sizeof entry->u.tnl_neigh_cache.br_name);
+        entry->u.tnl_neigh_cache.d_ipv6 = d_ip6;
     }
 
-    xlate_report(ctx, "tunneling from "ETH_ADDR_FMT" "IP_FMT
-                 " to "ETH_ADDR_FMT" "IP_FMT,
-                 ETH_ADDR_ARGS(smac), IP_ARGS(s_ip),
-                 ETH_ADDR_ARGS(dmac), IP_ARGS(d_ip));
+    xlate_report(ctx, "tunneling from "ETH_ADDR_FMT" %s"
+                 " to "ETH_ADDR_FMT" %s",
+                 ETH_ADDR_ARGS(smac), ipv6_string_mapped(buf_sip6, &s_ip6),
+                 ETH_ADDR_ARGS(dmac), buf_dip6);
+
     err = tnl_port_build_header(xport->ofport, flow,
-                                dmac, smac, s_ip, &tnl_push_data);
+                                dmac, smac, &s_ip6, &tnl_push_data);
     if (err) {
         return err;
     }
@@ -2828,7 +2906,7 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
 
     /* If 'struct flow' gets additional metadata, we'll need to zero it out
      * before traversing a patch port. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 34);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 35);
     memset(&flow_tnl, 0, sizeof flow_tnl);
 
     if (!xport) {
@@ -2949,6 +3027,9 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
          * recirculated packet! */
         ctx->exit = false;
 
+        /* Peer bridge errors do not propagate back. */
+        ctx->error = XLATE_OK;
+
         if (ctx->xin->resubmit_stats) {
             netdev_vport_inc_tx(xport->netdev, ctx->xin->resubmit_stats);
             netdev_vport_inc_rx(peer->netdev, ctx->xin->resubmit_stats);
@@ -2981,6 +3062,7 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
     }
 
     if (xport->is_tunnel) {
+        struct in6_addr dst;
          /* Save tunnel metadata so that changes made due to
           * the Logical (tunnel) Port are not visible for any further
           * matches, while explicit set actions on tunnel metadata are.
@@ -2991,7 +3073,8 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
             xlate_report(ctx, "Tunneling decided against output");
             goto out; /* restore flow_nw_tos */
         }
-        if (flow->tunnel.ip_dst == ctx->orig_tunnel_ip_dst) {
+        dst = flow_tnl_dst(&flow->tunnel);
+        if (ipv6_addr_equals(&dst, &ctx->orig_tunnel_ipv6_dst)) {
             xlate_report(ctx, "Not tunneling to our own address");
             goto out; /* restore flow_nw_tos */
         }
@@ -3126,17 +3209,20 @@ xlate_recursively(struct xlate_ctx *ctx, struct rule_dpif *rule)
 static bool
 xlate_resubmit_resource_check(struct xlate_ctx *ctx)
 {
-    static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
-
     if (ctx->recurse >= MAX_RESUBMIT_RECURSION + MAX_INTERNAL_RESUBMITS) {
-        VLOG_ERR_RL(&rl, "resubmit actions recursed over %d times",
-                    MAX_RESUBMIT_RECURSION);
+        XLATE_REPORT_ERROR(ctx, "resubmit actions recursed over %d times",
+                           MAX_RESUBMIT_RECURSION);
+        ctx->error = XLATE_RECURSION_TOO_DEEP;
     } else if (ctx->resubmits >= MAX_RESUBMITS + MAX_INTERNAL_RESUBMITS) {
-        VLOG_ERR_RL(&rl, "over %d resubmit actions", MAX_RESUBMITS);
+        XLATE_REPORT_ERROR(ctx, "over %d resubmit actions", MAX_RESUBMITS);
+        ctx->error = XLATE_TOO_MANY_RESUBMITS;
     } else if (ctx->odp_actions->size > UINT16_MAX) {
-        VLOG_ERR_RL(&rl, "resubmits yielded over 64 kB of actions");
+        XLATE_REPORT_ERROR(ctx, "resubmits yielded over 64 kB of actions");
+        /* NOT an error, as we'll be slow-pathing the flow in this case? */
+        ctx->exit = true; /* XXX: translation still terminated! */
     } else if (ctx->stack.size >= 65536) {
-        VLOG_ERR_RL(&rl, "resubmits yielded over 64 kB of stack");
+        XLATE_REPORT_ERROR(ctx, "resubmits yielded over 64 kB of stack");
+        ctx->error = XLATE_STACK_TOO_DEEP;
     } else {
         return true;
     }
@@ -3188,8 +3274,6 @@ xlate_table_action(struct xlate_ctx *ctx, ofp_port_t in_port, uint8_t table_id,
         ctx->table_id = old_table_id;
         return;
     }
-
-    ctx->exit = true;
 }
 
 static void
@@ -3488,13 +3572,12 @@ execute_controller_action(struct xlate_ctx *ctx, int len,
     struct dp_packet *packet;
 
     ctx->xout->slow |= SLOW_CONTROLLER;
+    xlate_commit_actions(ctx);
     if (!ctx->xin->packet) {
         return;
     }
 
     packet = dp_packet_clone(ctx->xin->packet);
-
-    xlate_commit_actions(ctx);
 
     odp_execute_actions(NULL, &packet, 1, false,
                         ctx->odp_actions->data, ctx->odp_actions->size, NULL);
@@ -3552,28 +3635,18 @@ compose_recirculate_action__(struct xlate_ctx *ctx, uint8_t table)
         .ofpacts = ctx->action_set.data,
     };
 
-    /* Only allocate recirculation ID if we have a packet. */
-    if (ctx->xin->packet) {
-        /* Allocate a unique recirc id for the given metadata state in the
-         * flow.  The life-cycle of this recirc id is managed by associating it
-         * with the udpif key ('ukey') created for each new datapath flow. */
-        id = recirc_alloc_id_ctx(&state);
-        if (!id) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-            VLOG_ERR_RL(&rl, "Failed to allocate recirculation id");
-            return;
-        }
-        xlate_out_add_recirc(ctx->xout, id);
-    } else {
-        /* Look up an existing recirc id for the given metadata state in the
-         * flow.  No new reference is taken, as the ID is RCU protected and is
-         * only required temporarily for verification.
-         *
-         * This might fail and return 0.  We let zero 'id' to be used in the
-         * RECIRC action below, which will fail all revalidations as zero is
-         * not a valid recirculation ID. */
-        id = recirc_find_id(&state);
+    /* Allocate a unique recirc id for the given metadata state in the
+     * flow.  An existing id, with a new reference to the corresponding
+     * recirculation context, will be returned if possible.
+     * The life-cycle of this recirc id is managed by associating it
+     * with the udpif key ('ukey') created for each new datapath flow. */
+    id = recirc_alloc_id_ctx(&state);
+    if (!id) {
+        XLATE_REPORT_ERROR(ctx, "Failed to allocate recirculation id");
+        ctx->error = XLATE_NO_RECIRCULATION_CONTEXT;
+        return;
     }
+    recirc_refs_add(&ctx->xout->recircs, id);
 
     nl_msg_put_u32(ctx->odp_actions, OVS_ACTION_ATTR_RECIRC, id);
 
@@ -3615,13 +3688,12 @@ compose_mpls_push_action(struct xlate_ctx *ctx, struct ofpact_push_mpls *mpls)
         xlate_commit_actions(ctx);
     } else if (n >= FLOW_MAX_MPLS_LABELS) {
         if (ctx->xin->packet != NULL) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-            VLOG_WARN_RL(&rl, "bridge %s: dropping packet on which an "
+            XLATE_REPORT_ERROR(ctx, "bridge %s: dropping packet on which an "
                          "MPLS push action can't be performed as it would "
                          "have more MPLS LSEs than the %d supported.",
                          ctx->xbridge->name, FLOW_MAX_MPLS_LABELS);
         }
-        ctx->exit = true;
+        ctx->error = XLATE_TOO_MANY_MPLS_LABELS;
         return;
     }
 
@@ -3640,13 +3712,12 @@ compose_mpls_pop_action(struct xlate_ctx *ctx, ovs_be16 eth_type)
         }
     } else if (n >= FLOW_MAX_MPLS_LABELS) {
         if (ctx->xin->packet != NULL) {
-            static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-            VLOG_WARN_RL(&rl, "bridge %s: dropping packet on which an "
+            XLATE_REPORT_ERROR(ctx, "bridge %s: dropping packet on which an "
                          "MPLS pop action can't be performed as it has "
                          "more MPLS LSEs than the %d supported.",
                          ctx->xbridge->name, FLOW_MAX_MPLS_LABELS);
         }
-        ctx->exit = true;
+        ctx->error = XLATE_TOO_MANY_MPLS_LABELS;
         ofpbuf_clear(ctx->odp_actions);
     }
 }
@@ -4136,6 +4207,7 @@ recirc_unroll_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
         case OFPACT_SAMPLE:
         case OFPACT_DEBUG_RECIRC:
         case OFPACT_CT:
+        case OFPACT_NAT:
             break;
 
             /* These need not be copied for restoration. */
@@ -4208,6 +4280,62 @@ put_ct_helper(struct ofpbuf *odp_actions, struct ofpact_conntrack *ofc)
 }
 
 static void
+put_ct_nat(struct xlate_ctx *ctx)
+{
+    struct ofpact_nat *ofn = ctx->ct_nat_action;
+    size_t nat_offset;
+
+    if (!ofn) {
+        return;
+    }
+
+    nat_offset = nl_msg_start_nested(ctx->odp_actions, OVS_CT_ATTR_NAT);
+    if (ofn->flags & NX_NAT_F_SRC || ofn->flags & NX_NAT_F_DST) {
+        nl_msg_put_flag(ctx->odp_actions, ofn->flags & NX_NAT_F_SRC
+                        ? OVS_NAT_ATTR_SRC : OVS_NAT_ATTR_DST);
+        if (ofn->flags & NX_NAT_F_PERSISTENT) {
+            nl_msg_put_flag(ctx->odp_actions, OVS_NAT_ATTR_PERSISTENT);
+        }
+        if (ofn->flags & NX_NAT_F_PROTO_HASH) {
+            nl_msg_put_flag(ctx->odp_actions, OVS_NAT_ATTR_PROTO_HASH);
+        } else if (ofn->flags & NX_NAT_F_PROTO_RANDOM) {
+            nl_msg_put_flag(ctx->odp_actions, OVS_NAT_ATTR_PROTO_RANDOM);
+        }
+        if (ofn->range_af == AF_INET) {
+            nl_msg_put_be32(ctx->odp_actions, OVS_NAT_ATTR_IP_MIN,
+                           ofn->range.addr.ipv4.min);
+            if (ofn->range.addr.ipv4.max &&
+                (ntohl(ofn->range.addr.ipv4.max)
+                 > ntohl(ofn->range.addr.ipv4.min))) {
+                nl_msg_put_be32(ctx->odp_actions, OVS_NAT_ATTR_IP_MAX,
+                                ofn->range.addr.ipv4.max);
+            }
+        } else if (ofn->range_af == AF_INET6) {
+            nl_msg_put_unspec(ctx->odp_actions, OVS_NAT_ATTR_IP_MIN,
+                              &ofn->range.addr.ipv6.min,
+                              sizeof ofn->range.addr.ipv6.min);
+            if (!ipv6_mask_is_any(&ofn->range.addr.ipv6.max) &&
+                memcmp(&ofn->range.addr.ipv6.max, &ofn->range.addr.ipv6.min,
+                       sizeof ofn->range.addr.ipv6.max) > 0) {
+                nl_msg_put_unspec(ctx->odp_actions, OVS_NAT_ATTR_IP_MAX,
+                                  &ofn->range.addr.ipv6.max,
+                                  sizeof ofn->range.addr.ipv6.max);
+            }
+        }
+        if (ofn->range_af != AF_UNSPEC && ofn->range.proto.min) {
+            nl_msg_put_u16(ctx->odp_actions, OVS_NAT_ATTR_PROTO_MIN,
+                           ofn->range.proto.min);
+            if (ofn->range.proto.max &&
+                ofn->range.proto.max > ofn->range.proto.min) {
+                nl_msg_put_u16(ctx->odp_actions, OVS_NAT_ATTR_PROTO_MAX,
+                               ofn->range.proto.max);
+            }
+        }
+    }
+    nl_msg_end_nested(ctx->odp_actions, nat_offset);
+}
+
+static void
 compose_conntrack_action(struct xlate_ctx *ctx, struct ofpact_conntrack *ofc)
 {
     ovs_u128 old_ct_label = ctx->base_flow.ct_label;
@@ -4220,6 +4348,7 @@ compose_conntrack_action(struct xlate_ctx *ctx, struct ofpact_conntrack *ofc)
     xlate_commit_actions(ctx);
 
     /* Process nested actions first, to populate the key. */
+    ctx->ct_nat_action = NULL;
     do_xlate_actions(ofc->actions, ofpact_ct_get_action_len(ofc), ctx);
 
     if (ofc->zone_src.field) {
@@ -4236,6 +4365,8 @@ compose_conntrack_action(struct xlate_ctx *ctx, struct ofpact_conntrack *ofc)
     put_ct_mark(&ctx->xin->flow, &ctx->base_flow, ctx->odp_actions, ctx->wc);
     put_ct_label(&ctx->xin->flow, &ctx->base_flow, ctx->odp_actions, ctx->wc);
     put_ct_helper(ctx->odp_actions, ofc);
+    put_ct_nat(ctx);
+    ctx->ct_nat_action = NULL;
     nl_msg_end_nested(ctx->odp_actions, ct_offset);
 
     /* Restore the original ct fields in the key. These should only be exposed
@@ -4263,8 +4394,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
     const struct ofpact *a;
 
     if (ovs_native_tunneling_is_on(ctx->xbridge->ofproto)) {
-        tnl_arp_snoop(flow, wc, ctx->xbridge->name);
-        tnl_nd_snoop(flow, wc, ctx->xbridge->name);
+        tnl_neigh_snoop(flow, wc, ctx->xbridge->name);
     }
     /* dl_type already in the mask, not set below. */
 
@@ -4273,6 +4403,10 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
         const struct ofpact_metadata *metadata;
         const struct ofpact_set_field *set_field;
         const struct mf_field *mf;
+
+        if (ctx->error) {
+            break;
+        }
 
         if (ctx->exit) {
             /* Check if need to store the remaining actions for later
@@ -4624,6 +4758,11 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             compose_conntrack_action(ctx, ofpact_get_CT(a));
             break;
 
+        case OFPACT_NAT:
+            /* This will be processed by compose_conntrack_action(). */
+            ctx->ct_nat_action = ofpact_get_NAT(a);
+            break;
+
         case OFPACT_DEBUG_RECIRC:
             ctx_trigger_recirculation(ctx);
             a = ofpact_next(a);
@@ -4632,7 +4771,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
 
         /* Check if need to store this and the remaining actions for later
          * execution. */
-        if (ctx->exit && ctx_first_recirculation_action(ctx)) {
+        if (!ctx->error && ctx->exit && ctx_first_recirculation_action(ctx)) {
             recirc_unroll_actions(a, OFPACT_ALIGN(ofpacts_len -
                                                   ((uint8_t *)a -
                                                    (uint8_t *)ofpacts)),
@@ -4678,7 +4817,7 @@ void
 xlate_out_uninit(struct xlate_out *xout)
 {
     if (xout) {
-        xlate_out_free_recircs(xout);
+        recirc_refs_unref(&xout->recircs);
     }
 }
 
@@ -4688,8 +4827,15 @@ void
 xlate_actions_for_side_effects(struct xlate_in *xin)
 {
     struct xlate_out xout;
+    enum xlate_error error;
 
-    xlate_actions(xin, &xout);
+    error = xlate_actions(xin, &xout);
+    if (error) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+
+        VLOG_WARN_RL(&rl, "xlate_actions failed (%s)!", xlate_strerror(error));
+    }
+
     xlate_out_uninit(&xout);
 }
 
@@ -4878,20 +5024,24 @@ xlate_wc_finish(struct xlate_ctx *ctx)
 /* Translates the flow, actions, or rule in 'xin' into datapath actions in
  * 'xout'.
  * The caller must take responsibility for eventually freeing 'xout', with
- * xlate_out_uninit(). */
-void
+ * xlate_out_uninit().
+ * Returns 'XLATE_OK' if translation was successful.  In case of an error an
+ * empty set of actions will be returned in 'xin->odp_actions' (if non-NULL),
+ * so that most callers may ignore the return value and transparently install a
+ * drop flow when the translation fails. */
+enum xlate_error
 xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 {
     *xout = (struct xlate_out) {
         .slow = 0,
         .fail_open = false,
-        .n_recircs = 0,
+        .recircs = RECIRC_REFS_EMPTY_INITIALIZER,
     };
 
     struct xlate_cfg *xcfg = ovsrcu_get(struct xlate_cfg *, &xcfgp);
     struct xbridge *xbridge = xbridge_lookup(xcfg, xin->ofproto);
     if (!xbridge) {
-        return;
+        return XLATE_BRIDGE_NOT_FOUND;
     }
 
     struct flow *flow = &xin->flow;
@@ -4905,7 +5055,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
         .xin = xin,
         .xout = xout,
         .base_flow = *flow,
-        .orig_tunnel_ip_dst = flow->tunnel.ip_dst,
+        .orig_tunnel_ipv6_dst = flow_tnl_dst(&flow->tunnel),
         .xbridge = xbridge,
         .stack = OFPBUF_STUB_INITIALIZER(stack_stub),
         .rule = xin->rule,
@@ -4924,6 +5074,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
         .sflow_odp_port = 0,
         .nf_output_iface = NF_OUT_DROP,
         .exit = false,
+        .error = XLATE_OK,
         .mirrors = 0,
 
         .recirc_action_offset = -1,
@@ -4931,6 +5082,8 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 
         .was_mpls = false,
         .conntracked = false,
+
+        .ct_nat_action = NULL,
 
         .action_set_has_group = false,
         .action_set = OFPBUF_STUB_INITIALIZER(action_set_stub),
@@ -4976,6 +5129,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 
             VLOG_WARN_RL(&rl, "Recirculation conflict (%s)!", conflict);
             xlate_report(&ctx, "- Recirculation conflict (%s)!", conflict);
+            ctx.error = XLATE_RECIRCULATION_CONFLICT;
             goto exit;
         }
 
@@ -4990,6 +5144,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
                 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 1);
                 VLOG_WARN_RL(&rl, "Recirculation bridge no longer exists.");
                 xlate_report(&ctx, "- Recirculation bridge no longer exists.");
+                ctx.error = XLATE_BRIDGE_NOT_FOUND;
                 goto exit;
             }
             ctx.xbridge = new_bridge;
@@ -5049,6 +5204,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 
         VLOG_WARN_RL(&rl, "Recirculation context not found for ID %"PRIx32,
                      flow->recirc_id);
+        ctx.error = XLATE_NO_RECIRCULATION_CONTEXT;
         goto exit;
     }
     /* The bridge is now known so obtain its table version. */
@@ -5140,6 +5296,9 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
 
             mirror_ingress_packet(&ctx);
             do_xlate_actions(ofpacts, ofpacts_len, &ctx);
+            if (ctx.error) {
+                goto exit;
+            }
 
             /* We've let OFPP_NORMAL and the learning action look at the
              * packet, so drop it now if forwarding is disabled. */
@@ -5219,6 +5378,15 @@ exit:
     ofpbuf_uninit(&ctx.stack);
     ofpbuf_uninit(&ctx.action_set);
     ofpbuf_uninit(&scratch_actions);
+
+    /* Make sure we return a "drop flow" in case of an error. */
+    if (ctx.error) {
+        xout->slow = 0;
+        if (xin->odp_actions) {
+            ofpbuf_clear(xin->odp_actions);
+        }
+    }
+    return ctx.error;
 }
 
 /* Sends 'packet' out 'ofport'.
@@ -5354,10 +5522,10 @@ xlate_push_stats(struct xlate_cache *xcache,
             group_dpif_credit_stats(entry->u.group.group, entry->u.group.bucket,
                                     stats);
             break;
-        case XC_TNL_ARP:
-            /* Lookup arp to avoid arp timeout. */
-            tnl_arp_lookup(entry->u.tnl_arp_cache.br_name,
-                           entry->u.tnl_arp_cache.d_ip, &dmac);
+        case XC_TNL_NEIGH:
+            /* Lookup neighbor to avoid timeout. */
+            tnl_neigh_lookup(entry->u.tnl_neigh_cache.br_name,
+                             &entry->u.tnl_neigh_cache.d_ipv6, &dmac);
             break;
         default:
             OVS_NOT_REACHED();
@@ -5429,7 +5597,7 @@ xlate_cache_clear(struct xlate_cache *xcache)
         case XC_GROUP:
             group_dpif_unref(entry->u.group.group);
             break;
-        case XC_TNL_ARP:
+        case XC_TNL_NEIGH:
             break;
         default:
             OVS_NOT_REACHED();

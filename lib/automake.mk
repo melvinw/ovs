@@ -51,6 +51,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/crc32c.h \
 	lib/csum.c \
 	lib/csum.h \
+	lib/ct-dpif.c \
+	lib/ct-dpif.h \
 	lib/daemon.c \
 	lib/daemon.h \
 	lib/daemon-private.h \
@@ -250,8 +252,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/timer.h \
 	lib/timeval.c \
 	lib/timeval.h \
-	lib/tnl-arp-cache.c \
-	lib/tnl-arp-cache.h \
+	lib/tnl-neigh-cache.c \
+	lib/tnl-neigh-cache.h \
 	lib/tnl-ports.c \
 	lib/tnl-ports.h \
 	lib/token-bucket.c \
@@ -343,6 +345,8 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/if-notifier.h \
 	lib/netdev-linux.c \
 	lib/netdev-linux.h \
+	lib/netlink-conntrack.c \
+	lib/netlink-conntrack.h \
 	lib/netlink-notifier.c \
 	lib/netlink-notifier.h \
 	lib/netlink-protocol.h \

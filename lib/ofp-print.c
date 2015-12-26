@@ -990,6 +990,18 @@ ofputil_put_eviction_flags(struct ds *string, uint32_t eviction_flags)
     }
 }
 
+static const char *
+ofputil_table_vacancy_to_string(enum ofputil_table_vacancy vacancy)
+{
+    switch (vacancy) {
+    case OFPUTIL_TABLE_VACANCY_DEFAULT: return "default";
+    case OFPUTIL_TABLE_VACANCY_ON: return "on";
+    case OFPUTIL_TABLE_VACANCY_OFF: return "off";
+    default: return "***error***";
+    }
+
+}
+
 static void
 ofp_print_table_mod(struct ds *string, const struct ofp_header *oh)
 {
@@ -1020,6 +1032,15 @@ ofp_print_table_mod(struct ds *string, const struct ofp_header *oh)
         ds_put_cstr(string, "eviction_flags=");
         ofputil_put_eviction_flags(string, pm.eviction_flags);
     }
+    if (pm.vacancy != OFPUTIL_TABLE_VACANCY_DEFAULT) {
+        ds_put_format(string, ", vacancy=%s",
+                      ofputil_table_vacancy_to_string(pm.vacancy));
+        if (pm.vacancy == OFPUTIL_TABLE_VACANCY_ON) {
+            ds_put_format(string, " vacancy:%"PRIu8""
+                          ",%"PRIu8"", pm.table_vacancy.vacancy_down,
+                          pm.table_vacancy.vacancy_up);
+        }
+    }
 }
 
 /* This function will print the Table description properties. */
@@ -1031,6 +1052,17 @@ ofp_print_table_desc(struct ds *string, const struct ofputil_table_desc *td)
     ds_put_format(string, "   eviction=%s eviction_flags=",
                   ofputil_table_eviction_to_string(td->eviction));
     ofputil_put_eviction_flags(string, td->eviction_flags);
+    ds_put_char(string, '\n');
+    ds_put_format(string, "   vacancy=%s",
+                  ofputil_table_vacancy_to_string(td->vacancy));
+    if (td->vacancy == OFPUTIL_TABLE_VACANCY_ON) {
+        ds_put_format(string, " vacancy_down=%"PRIu8"%%",
+                      td->table_vacancy.vacancy_down);
+        ds_put_format(string, " vacancy_up=%"PRIu8"%%",
+                      td->table_vacancy.vacancy_up);
+        ds_put_format(string, " vacancy=%"PRIu8"%%",
+                      td->table_vacancy.vacancy);
+    }
     ds_put_char(string, '\n');
 }
 
@@ -1847,6 +1879,7 @@ ofp_print_role_status_message(struct ds *string, const struct ofp_header *oh)
     case OFPCRR_EXPERIMENTER:
         ds_put_cstr(string, "experimenter_data_changed");
         break;
+    case OFPCRR_N_REASONS:
     default:
         OVS_NOT_REACHED();
     }
@@ -1905,6 +1938,7 @@ ofp_port_reason_to_string(enum ofp_port_reason reason,
     case OFPPR_MODIFY:
         return "modify";
 
+    case OFPPR_N_REASONS:
     default:
         snprintf(reasonbuf, bufsize, "%d", (int) reason);
         return reasonbuf;
@@ -1928,6 +1962,7 @@ ofp_role_reason_to_string(enum ofp14_controller_role_reason reason,
     case OFPCRR_EXPERIMENTER:
         return "experimenter_data_changed";
 
+    case OFPCRR_N_REASONS:
     default:
         snprintf(reasonbuf, bufsize, "%d", (int) reason);
         return reasonbuf;
@@ -1948,6 +1983,7 @@ ofp_table_reason_to_string(enum ofp14_table_reason reason,
     case OFPTR_VACANCY_UP:
         return "vacancy_up";
 
+    case OFPTR_N_REASONS:
     default:
         snprintf(reasonbuf, bufsize, "%d", (int) reason);
         return reasonbuf;
@@ -1968,6 +2004,7 @@ ofp_requestforward_reason_to_string(enum ofp14_requestforward_reason reason,
     case OFPRFR_METER_MOD:
         return "meter_mod_request";
 
+    case OFPRFR_N_REASONS:
     default:
         snprintf(reasonbuf, bufsize, "%d", (int) reason);
         return reasonbuf;
@@ -2074,10 +2111,22 @@ ofp_print_nxt_set_async_config(struct ds *string,
         }
     } else if (raw == OFPRAW_OFPT14_SET_ASYNC ||
                raw == OFPRAW_OFPT14_GET_ASYNC_REPLY) {
+        enum ofperr error = 0;
         uint32_t role[2][OAM_N_TYPES] = {{0}};
         uint32_t type;
 
-        ofputil_decode_set_async_config(oh, role[0], role[1], true);
+        if (raw == OFPRAW_OFPT14_GET_ASYNC_REPLY) {
+            error = ofputil_decode_set_async_config(oh, role[0], role[1], true);
+        }
+        else if (raw == OFPRAW_OFPT14_SET_ASYNC) {
+            error = ofputil_decode_set_async_config(oh, role[0], role[1],
+                                                    false);
+        }
+        if (error) {
+            ofp_print_error(string, error);
+            return;
+        }
+
         for (i = 0; i < 2; i++) {
 
             ds_put_format(string, "\n %s:\n", i == 0 ? "master" : "slave");
@@ -2385,7 +2434,7 @@ ofp_print_group(struct ds *s, uint32_t group_id, uint8_t type,
         if (bucket->watch_port != OFPP_NONE) {
             ds_put_format(s, "watch_port:%"PRIu32",", bucket->watch_port);
         }
-        if (bucket->watch_group != OFPG11_ANY) {
+        if (bucket->watch_group != OFPG_ANY) {
             ds_put_format(s, "watch_group:%"PRIu32",", bucket->watch_group);
         }
 
@@ -2982,9 +3031,9 @@ ofp_print_bundle_add(struct ds *s, const struct ofp_header *oh, int verbosity)
 }
 
 static void
-print_geneve_table(struct ds *s, struct ovs_list *mappings)
+print_tlv_table(struct ds *s, struct ovs_list *mappings)
 {
-    struct ofputil_geneve_map *map;
+    struct ofputil_tlv_map *map;
 
     ds_put_cstr(s, " mapping table:\n");
     ds_put_cstr(s, " class\ttype\tlength\tmatch field\n");
@@ -2999,12 +3048,12 @@ print_geneve_table(struct ds *s, struct ovs_list *mappings)
 }
 
 static void
-ofp_print_geneve_table_mod(struct ds *s, const struct ofp_header *oh)
+ofp_print_tlv_table_mod(struct ds *s, const struct ofp_header *oh)
 {
     int error;
-    struct ofputil_geneve_table_mod gtm;
+    struct ofputil_tlv_table_mod ttm;
 
-    error = ofputil_decode_geneve_table_mod(oh, &gtm);
+    error = ofputil_decode_tlv_table_mod(oh, &ttm);
     if (error) {
         ofp_print_error(s, error);
         return;
@@ -3012,34 +3061,34 @@ ofp_print_geneve_table_mod(struct ds *s, const struct ofp_header *oh)
 
     ds_put_cstr(s, "\n ");
 
-    switch (gtm.command) {
-    case NXGTMC_ADD:
+    switch (ttm.command) {
+    case NXTTMC_ADD:
         ds_put_cstr(s, "ADD");
         break;
-    case NXGTMC_DELETE:
+    case NXTTMC_DELETE:
         ds_put_cstr(s, "DEL");
         break;
-    case NXGTMC_CLEAR:
+    case NXTTMC_CLEAR:
         ds_put_cstr(s, "CLEAR");
         break;
     }
 
-    if (gtm.command != NXGTMC_CLEAR) {
-        print_geneve_table(s, &gtm.mappings);
+    if (ttm.command != NXTTMC_CLEAR) {
+        print_tlv_table(s, &ttm.mappings);
     }
 
-    ofputil_uninit_geneve_table(&gtm.mappings);
+    ofputil_uninit_tlv_table(&ttm.mappings);
 }
 
 static void
-ofp_print_geneve_table_reply(struct ds *s, const struct ofp_header *oh)
+ofp_print_tlv_table_reply(struct ds *s, const struct ofp_header *oh)
 {
     int error;
-    struct ofputil_geneve_table_reply gtr;
-    struct ofputil_geneve_map *map;
+    struct ofputil_tlv_table_reply ttr;
+    struct ofputil_tlv_map *map;
     int allocated_space = 0;
 
-    error = ofputil_decode_geneve_table_reply(oh, &gtr);
+    error = ofputil_decode_tlv_table_reply(oh, &ttr);
     if (error) {
         ofp_print_error(s, error);
         return;
@@ -3047,17 +3096,17 @@ ofp_print_geneve_table_reply(struct ds *s, const struct ofp_header *oh)
 
     ds_put_char(s, '\n');
 
-    LIST_FOR_EACH (map, list_node, &gtr.mappings) {
+    LIST_FOR_EACH (map, list_node, &ttr.mappings) {
         allocated_space += map->option_len;
     }
 
     ds_put_format(s, " max option space=%"PRIu32" max fields=%"PRIu16"\n",
-                  gtr.max_option_space, gtr.max_fields);
+                  ttr.max_option_space, ttr.max_fields);
     ds_put_format(s, " allocated option space=%d\n", allocated_space);
     ds_put_char(s, '\n');
-    print_geneve_table(s, &gtr.mappings);
+    print_tlv_table(s, &ttr.mappings);
 
-    ofputil_uninit_geneve_table(&gtr.mappings);
+    ofputil_uninit_tlv_table(&ttr.mappings);
 }
 
 /* This function will print the request forward message. The reason for
@@ -3086,6 +3135,9 @@ ofp_print_requestforward(struct ds *string, const struct ofp_header *oh)
         ds_put_cstr(string, "meter_mod");
         ofp_print_meter_mod__(string, rf.meter_mod);
         break;
+
+    case OFPRFR_N_REASONS:
+        OVS_NOT_REACHED();
     }
     ofputil_destroy_requestforward(&rf);
 }
@@ -3358,15 +3410,15 @@ ofp_to_string__(const struct ofp_header *oh, enum ofpraw raw,
         ofp_print_bundle_add(string, msg, verbosity);
         break;
 
-    case OFPTYPE_NXT_GENEVE_TABLE_MOD:
-        ofp_print_geneve_table_mod(string, msg);
+    case OFPTYPE_NXT_TLV_TABLE_MOD:
+        ofp_print_tlv_table_mod(string, msg);
         break;
 
-    case OFPTYPE_NXT_GENEVE_TABLE_REQUEST:
+    case OFPTYPE_NXT_TLV_TABLE_REQUEST:
         break;
 
-    case OFPTYPE_NXT_GENEVE_TABLE_REPLY:
-        ofp_print_geneve_table_reply(string, msg);
+    case OFPTYPE_NXT_TLV_TABLE_REPLY:
+        ofp_print_tlv_table_reply(string, msg);
         break;
 
     }

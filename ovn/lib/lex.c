@@ -21,6 +21,7 @@
 #include <stdarg.h>
 #include "dynamic-string.h"
 #include "json.h"
+#include "packets.h"
 #include "util.h"
 
 /* Returns a string that represents 'format'. */
@@ -117,7 +118,7 @@ lex_token_format_value(const union mf_subvalue *value,
         break;
 
     case LEX_F_IPV6:
-        print_ipv6_addr(s, &value->ipv6);
+        ipv6_format_addr(&value->ipv6, s);
         break;
 
     case LEX_F_ETHERNET:
@@ -338,13 +339,9 @@ lex_parse_integer__(const char *p, struct lex_token *token)
         memcpy(copy, p, len);
         copy[len] = '\0';
 
-        struct in_addr ipv4;
-        struct in6_addr ipv6;
-        if (inet_pton(AF_INET, copy, &ipv4) == 1) {
-            token->value.ipv4 = ipv4.s_addr;
+        if (ip_parse(copy, &token->value.ipv4)) {
             token->format = LEX_F_IPV4;
-        } else if (inet_pton(AF_INET6, copy, &ipv6) == 1) {
-            token->value.ipv6 = ipv6;
+        } else if (ipv6_parse(copy, &token->value.ipv6)) {
             token->format = LEX_F_IPV6;
         } else {
             lex_error(token, "Invalid numeric constant.");

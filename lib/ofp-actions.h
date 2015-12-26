@@ -107,6 +107,7 @@
     OFPACT(SAMPLE,          ofpact_sample,      ofpact, "sample")       \
     OFPACT(UNROLL_XLATE,    ofpact_unroll_xlate, ofpact, "unroll_xlate") \
     OFPACT(CT,              ofpact_conntrack,   ofpact, "ct")           \
+    OFPACT(NAT,             ofpact_nat,         ofpact, "nat")          \
                                                                         \
     /* Debugging actions.                                               \
      *                                                                  \
@@ -184,11 +185,14 @@ BUILD_ASSERT_DECL(sizeof(struct ofpact) == 4);
 #define OFPACT_ALIGNTO 8
 #define OFPACT_ALIGN(SIZE) ROUND_UP(SIZE, OFPACT_ALIGNTO)
 
+/* Returns the ofpact following 'ofpact'. */
 static inline struct ofpact *
 ofpact_next(const struct ofpact *ofpact)
 {
     return (void *) ((uint8_t *) ofpact + OFPACT_ALIGN(ofpact->len));
 }
+
+struct ofpact *ofpact_next_flattened(const struct ofpact *);
 
 static inline struct ofpact *
 ofpact_end(const struct ofpact *ofpacts, size_t ofpacts_len)
@@ -201,6 +205,15 @@ ofpact_end(const struct ofpact *ofpacts, size_t ofpacts_len)
 #define OFPACT_FOR_EACH(POS, OFPACTS, OFPACTS_LEN)                      \
     for ((POS) = (OFPACTS); (POS) < ofpact_end(OFPACTS, OFPACTS_LEN);  \
          (POS) = ofpact_next(POS))
+
+/* Assigns POS to each ofpact, in turn, in the OFPACTS_LEN bytes of ofpacts
+ * starting at OFPACTS.
+ *
+ * For ofpacts that contain nested ofpacts, this visits each of the inner
+ * ofpacts as well. */
+#define OFPACT_FOR_EACH_FLATTENED(POS, OFPACTS, OFPACTS_LEN)           \
+    for ((POS) = (OFPACTS); (POS) < ofpact_end(OFPACTS, OFPACTS_LEN);  \
+         (POS) = ofpact_next_flattened(POS))
 
 /* Action structure for each OFPACT_*. */
 
@@ -499,6 +512,10 @@ struct {                                \
     uint8_t recirc_table;               \
 }
 
+#if !defined(IPPORT_FTP)
+#define	IPPORT_FTP  21
+#endif
+
 /* OFPACT_CT.
  *
  * Used for NXAST_CT. */
@@ -528,6 +545,42 @@ ofpact_nest_get_action_len(const struct ofpact_nest *on)
 
 void ofpacts_execute_action_set(struct ofpbuf *action_list,
                                 const struct ofpbuf *action_set);
+
+/* Bits for 'flags' in struct nx_action_nat.
+ */
+enum nx_nat_flags {
+    NX_NAT_F_SRC          = 1 << 0,
+    NX_NAT_F_DST          = 1 << 1,
+    NX_NAT_F_PERSISTENT   = 1 << 2,
+    NX_NAT_F_PROTO_HASH   = 1 << 3,
+    NX_NAT_F_PROTO_RANDOM = 1 << 4,
+};
+
+/* OFPACT_NAT.
+ *
+ * Used for NXAST_NAT. */
+struct ofpact_nat {
+    struct ofpact ofpact;
+    uint8_t range_af; /* AF_UNSPEC, AF_INET, or AF_INET6 */
+    uint16_t flags;  /* NX_NAT_F_* */
+    struct {
+        struct {
+            uint16_t min;
+            uint16_t max;
+        } proto;
+        union {
+            struct {
+                ovs_be32 min;
+                ovs_be32 max;
+            } ipv4;
+            struct {
+                struct in6_addr min;
+                struct in6_addr max;
+            } ipv6;
+        } addr;
+    } range;
+};
+
 
 /* OFPACT_RESUBMIT.
  *
@@ -821,6 +874,7 @@ bool ofpacts_output_to_group(const struct ofpact[], size_t ofpacts_len,
                              uint32_t group_id);
 bool ofpacts_equal(const struct ofpact a[], size_t a_len,
                    const struct ofpact b[], size_t b_len);
+const struct mf_field *ofpact_get_mf_dst(const struct ofpact *ofpact);
 uint32_t ofpacts_get_meter(const struct ofpact[], size_t ofpacts_len);
 
 /* Formatting and parsing ofpacts. */
@@ -844,7 +898,7 @@ void *ofpact_put(struct ofpbuf *, enum ofpact_type, size_t len);
  *
  *     Appends a new 'ofpact', of length OFPACT_<ENUM>_RAW_SIZE, to 'ofpacts',
  *     initializes it with ofpact_init_<ENUM>(), and returns it.  Also sets
- *     'ofpacts->l2' to the returned action.
+ *     'ofpacts->header' to the returned action.
  *
  *     After using this function to add a variable-length action, add the
  *     elements of the flexible array (e.g. with ofpbuf_put()), then use

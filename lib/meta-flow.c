@@ -190,6 +190,10 @@ mf_is_all_wild(const struct mf_field *mf, const struct flow_wildcards *wc)
         return !wc->masks.tunnel.ip_src;
     case MFF_TUN_DST:
         return !wc->masks.tunnel.ip_dst;
+    case MFF_TUN_IPV6_SRC:
+        return ipv6_mask_is_any(&wc->masks.tunnel.ipv6_src);
+    case MFF_TUN_IPV6_DST:
+        return ipv6_mask_is_any(&wc->masks.tunnel.ipv6_dst);
     case MFF_TUN_ID:
         return !wc->masks.tunnel.tun_id;
     case MFF_TUN_TOS:
@@ -496,6 +500,8 @@ mf_is_value_valid(const struct mf_field *mf, const union mf_value *value)
     case MFF_TUN_ID:
     case MFF_TUN_SRC:
     case MFF_TUN_DST:
+    case MFF_TUN_IPV6_SRC:
+    case MFF_TUN_IPV6_DST:
     case MFF_TUN_TOS:
     case MFF_TUN_TTL:
     case MFF_TUN_GBP_ID:
@@ -617,6 +623,12 @@ mf_get_value(const struct mf_field *mf, const struct flow *flow,
     case MFF_TUN_DST:
         value->be32 = flow->tunnel.ip_dst;
         break;
+    case MFF_TUN_IPV6_SRC:
+        value->ipv6 = flow->tunnel.ipv6_src;
+        break;
+    case MFF_TUN_IPV6_DST:
+        value->ipv6 = flow->tunnel.ipv6_dst;
+        break;
     case MFF_TUN_FLAGS:
         value->be16 = htons(flow->tunnel.flags & FLOW_TNL_PUB_F_MASK);
         break;
@@ -671,7 +683,7 @@ mf_get_value(const struct mf_field *mf, const struct flow *flow,
         break;
 
     case MFF_CT_LABEL:
-        hton128(&flow->ct_label, &value->be128);
+        value->be128 = hton128(flow->ct_label);
         break;
 
     CASE_MFF_REGS:
@@ -858,6 +870,12 @@ mf_set_value(const struct mf_field *mf,
     case MFF_TUN_DST:
         match_set_tun_dst(match, value->be32);
         break;
+    case MFF_TUN_IPV6_SRC:
+        match_set_tun_ipv6_src(match, &value->ipv6);
+        break;
+    case MFF_TUN_IPV6_DST:
+        match_set_tun_ipv6_dst(match, &value->ipv6);
+        break;
     case MFF_TUN_FLAGS:
         match_set_tun_flags(match, ntohs(value->be16));
         break;
@@ -918,13 +936,9 @@ mf_set_value(const struct mf_field *mf,
         match_set_ct_mark(match, ntohl(value->be32));
         break;
 
-    case MFF_CT_LABEL: {
-        ovs_u128 label;
-
-        ntoh128(&value->be128, &label);
-        match_set_ct_label(match, label);
+    case MFF_CT_LABEL:
+        match_set_ct_label(match, ntoh128(value->be128));
         break;
-    }
 
     CASE_MFF_REGS:
         match_set_reg(match, mf->id - MFF_REG0, ntohl(value->be32));
@@ -1168,6 +1182,12 @@ mf_set_flow_value(const struct mf_field *mf,
     case MFF_TUN_DST:
         flow->tunnel.ip_dst = value->be32;
         break;
+    case MFF_TUN_IPV6_SRC:
+        flow->tunnel.ipv6_src = value->ipv6;
+        break;
+    case MFF_TUN_IPV6_DST:
+        flow->tunnel.ipv6_dst = value->ipv6;
+        break;
     case MFF_TUN_FLAGS:
         flow->tunnel.flags = (flow->tunnel.flags & ~FLOW_TNL_PUB_F_MASK) |
                              ntohs(value->be16);
@@ -1223,7 +1243,7 @@ mf_set_flow_value(const struct mf_field *mf,
         break;
 
     case MFF_CT_LABEL:
-        ntoh128(&value->be128, &flow->ct_label);
+        flow->ct_label = ntoh128(value->be128);
         break;
 
     CASE_MFF_REGS:
@@ -1471,6 +1491,18 @@ mf_set_wild(const struct mf_field *mf, struct match *match, char **err_str)
         break;
     case MFF_TUN_DST:
         match_set_tun_dst_masked(match, htonl(0), htonl(0));
+        break;
+    case MFF_TUN_IPV6_SRC:
+        memset(&match->wc.masks.tunnel.ipv6_src, 0,
+               sizeof match->wc.masks.tunnel.ipv6_src);
+        memset(&match->flow.tunnel.ipv6_src, 0,
+               sizeof match->flow.tunnel.ipv6_src);
+        break;
+    case MFF_TUN_IPV6_DST:
+        memset(&match->wc.masks.tunnel.ipv6_dst, 0,
+               sizeof match->wc.masks.tunnel.ipv6_dst);
+        memset(&match->flow.tunnel.ipv6_dst, 0,
+               sizeof match->flow.tunnel.ipv6_dst);
         break;
     case MFF_TUN_FLAGS:
         match_set_tun_flags_masked(match, 0, 0);
@@ -1764,6 +1796,12 @@ mf_set(const struct mf_field *mf,
     case MFF_TUN_DST:
         match_set_tun_dst_masked(match, value->be32, mask->be32);
         break;
+    case MFF_TUN_IPV6_SRC:
+        match_set_tun_ipv6_src_masked(match, &value->ipv6, &mask->ipv6);
+        break;
+    case MFF_TUN_IPV6_DST:
+        match_set_tun_ipv6_dst_masked(match, &value->ipv6, &mask->ipv6);
+        break;
     case MFF_TUN_FLAGS:
         match_set_tun_flags_masked(match, ntohs(value->be16), ntohs(mask->be16));
         break;
@@ -1810,18 +1848,10 @@ mf_set(const struct mf_field *mf,
         match_set_ct_mark_masked(match, ntohl(value->be32), ntohl(mask->be32));
         break;
 
-    case MFF_CT_LABEL: {
-        ovs_u128 hlabel, hmask;
-
-        ntoh128(&value->be128, &hlabel);
-        if (mask) {
-            ntoh128(&mask->be128, &hmask);
-        } else {
-            hmask.u64.lo = hmask.u64.hi = UINT64_MAX;
-        }
-        match_set_ct_label_masked(match, hlabel, hmask);
+    case MFF_CT_LABEL:
+        match_set_ct_label_masked(match, ntoh128(value->be128),
+                                  mask ? ntoh128(mask->be128) : OVS_U128_MAX);
         break;
-    }
 
     case MFF_ETH_DST:
         match_set_dl_dst_masked(match, value->mac, mask->mac);
@@ -2048,43 +2078,10 @@ mf_from_ipv4_string(const struct mf_field *mf, const char *s,
 
 static char *
 mf_from_ipv6_string(const struct mf_field *mf, const char *s,
-                    struct in6_addr *value, struct in6_addr *mask)
+                    struct in6_addr *ipv6, struct in6_addr *mask)
 {
-    char *str = xstrdup(s);
-    char *save_ptr = NULL;
-    const char *name, *netmask;
-    int retval;
-
-    ovs_assert(mf->n_bytes == sizeof *value);
-
-    name = strtok_r(str, "/", &save_ptr);
-    retval = name ? lookup_ipv6(name, value) : EINVAL;
-    if (retval) {
-        char *err;
-
-        err = xasprintf("%s: could not convert to IPv6 address", str);
-        free(str);
-
-        return err;
-    }
-
-    netmask = strtok_r(NULL, "/", &save_ptr);
-    if (netmask) {
-        if (inet_pton(AF_INET6, netmask, mask) != 1) {
-            int prefix = atoi(netmask);
-            if (prefix <= 0 || prefix > 128) {
-                free(str);
-                return xasprintf("%s: prefix bits not between 1 and 128", s);
-            } else {
-                *mask = ipv6_create_mask(prefix);
-            }
-        }
-    } else {
-        *mask = in6addr_exact;
-    }
-    free(str);
-
-    return NULL;
+    ovs_assert(mf->n_bytes == sizeof *ipv6);
+    return ipv6_parse_masked(s, ipv6, mask);
 }
 
 static char *
@@ -2422,7 +2419,7 @@ mf_format(const struct mf_field *mf,
         break;
 
     case MFS_IPV6:
-        print_ipv6_masked(s, &value->ipv6, mask ? &mask->ipv6 : NULL);
+        ipv6_format_masked(&value->ipv6, mask ? &mask->ipv6 : NULL, s);
         break;
 
     case MFS_FRAG:

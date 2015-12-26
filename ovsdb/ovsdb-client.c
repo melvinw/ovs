@@ -44,6 +44,7 @@
 #include "stream.h"
 #include "stream-ssl.h"
 #include "table.h"
+#include "monitor.h"
 #include "timeval.h"
 #include "unixctl.h"
 #include "util.h"
@@ -256,6 +257,9 @@ usage(void)
            "\n  monitor [SERVER] [DATABASE] ALL\n"
            "    monitor all changes to all columns in all tables\n"
            "    in DATBASE on SERVER.\n"
+           "\n  monitor2 [SERVER] [DATABASE] ALL\n"
+           "    same usage as monitor, but uses \"monitor2\" method over"
+           "    the wire."
            "\n  dump [SERVER] [DATABASE]\n"
            "    dump contents of DATABASE on SERVER to stdout\n"
            "\nThe default SERVER is unix:%s/db.sock.\n"
@@ -617,6 +621,101 @@ monitor_print(struct json *table_updates,
 }
 
 static void
+monitor2_print_row(struct json *row, const char *type, const char *uuid,
+                   const struct ovsdb_column_set *columns, struct table *t)
+{
+    if (!strcmp(type, "delete")) {
+        if (row->type != JSON_NULL) {
+            ovs_error(0, "delete method does not expect <row>");
+            return;
+        }
+
+        table_add_row(t);
+        table_add_cell(t)->text = xstrdup(uuid);
+        table_add_cell(t)->text = xstrdup(type);
+    } else {
+        if (!row || row->type != JSON_OBJECT) {
+            ovs_error(0, "<row> is not object");
+            return;
+        }
+        monitor_print_row(row, type, uuid, columns, t);
+    }
+}
+
+static void
+monitor2_print_table(struct json *table_update2,
+                    const struct monitored_table *mt, char *caption)
+{
+    const struct ovsdb_table_schema *table = mt->table;
+    const struct ovsdb_column_set *columns = &mt->columns;
+    struct shash_node *node;
+    struct table t;
+    size_t i;
+
+    if (table_update2->type != JSON_OBJECT) {
+        ovs_error(0, "<table-update> for table %s is not object", table->name);
+        return;
+    }
+
+    table_init(&t);
+    table_set_timestamp(&t, timestamp);
+    table_set_caption(&t, caption);
+
+    table_add_column(&t, "row");
+    table_add_column(&t, "action");
+    for (i = 0; i < columns->n_columns; i++) {
+        table_add_column(&t, "%s", columns->columns[i]->name);
+    }
+    SHASH_FOR_EACH (node, json_object(table_update2)) {
+        struct json *row_update2 = node->data;
+        const char *operation;
+        struct json *row;
+        const char *ops[] = {"delete", "initial", "modify", "insert"};
+
+        if (row_update2->type != JSON_OBJECT) {
+            ovs_error(0, "<row-update2> is not object");
+            continue;
+        }
+
+        /* row_update2 contains one of objects indexed by ops[] */
+        for (int i = 0; i < ARRAY_SIZE(ops); i++) {
+            operation = ops[i];
+            row = shash_find_data(json_object(row_update2), operation);
+
+            if (row) {
+                monitor2_print_row(row, operation, node->name, columns, &t);
+                break;
+            }
+        }
+    }
+    table_print(&t, &table_style);
+    table_destroy(&t);
+}
+
+static void
+monitor2_print(struct json *table_updates2,
+               const struct monitored_table *mts, size_t n_mts)
+{
+    size_t i;
+
+    if (table_updates2->type != JSON_OBJECT) {
+        ovs_error(0, "<table-updates2> is not object");
+        return;
+    }
+
+    for (i = 0; i < n_mts; i++) {
+        const struct monitored_table *mt = &mts[i];
+        struct json *table_update = shash_find_data(
+                                        json_object(table_updates2),
+                                        mt->table->name);
+        if (table_update) {
+            monitor2_print_table(table_update, mt,
+                                n_mts > 1 ? xstrdup(mt->table->name) : NULL);
+        }
+    }
+}
+
+static void
 add_column(const char *server, const struct ovsdb_column *column,
            struct ovsdb_column_set *columns, struct json *columns_json)
 {
@@ -776,8 +875,9 @@ add_monitored_table(int argc, char *argv[],
 }
 
 static void
-do_monitor(struct jsonrpc *rpc, const char *database,
-           int argc, char *argv[])
+do_monitor__(struct jsonrpc *rpc, const char *database,
+             enum ovsdb_monitor_version version,
+             int argc, char *argv[])
 {
     const char *server = jsonrpc_get_name(rpc);
     const char *table_name = argv[0];
@@ -790,6 +890,8 @@ do_monitor(struct jsonrpc *rpc, const char *database,
 
     struct monitored_table *mts;
     size_t n_mts, allocated_mts;
+
+    ovs_assert(version < OVSDB_MONITOR_VERSION_MAX);
 
     daemon_save_fd(STDOUT_FILENO);
     daemonize_start(false);
@@ -845,7 +947,10 @@ do_monitor(struct jsonrpc *rpc, const char *database,
 
     monitor = json_array_create_3(json_string_create(database),
                                   json_null_create(), monitor_requests);
-    request = jsonrpc_create_request("monitor", monitor, NULL);
+    const char *method = version == OVSDB_MONITOR_V2 ? "monitor2"
+                                                     : "monitor";
+
+    request = jsonrpc_create_request(method, monitor, NULL);
     request_id = json_clone(request->id);
     jsonrpc_send(rpc, request);
 
@@ -867,7 +972,17 @@ do_monitor(struct jsonrpc *rpc, const char *database,
                                                        msg->id));
             } else if (msg->type == JSONRPC_REPLY
                        && json_equal(msg->id, request_id)) {
-                monitor_print(msg->result, mts, n_mts, true);
+                switch(version) {
+                case OVSDB_MONITOR_V1:
+                    monitor_print(msg->result, mts, n_mts, true);
+                    break;
+                case OVSDB_MONITOR_V2:
+                    monitor2_print(msg->result, mts, n_mts);
+                    break;
+                case OVSDB_MONITOR_VERSION_MAX:
+                default:
+                    OVS_NOT_REACHED();
+                }
                 fflush(stdout);
                 daemonize_complete();
             } else if (msg->type == JSONRPC_NOTIFY
@@ -877,6 +992,16 @@ do_monitor(struct jsonrpc *rpc, const char *database,
                     && params->u.array.n == 2
                     && params->u.array.elems[0]->type == JSON_NULL) {
                     monitor_print(params->u.array.elems[1], mts, n_mts, false);
+                    fflush(stdout);
+                }
+            } else if (msg->type == JSONRPC_NOTIFY
+                       && version == OVSDB_MONITOR_V2
+                       && !strcmp(msg->method, "update2")) {
+                struct json *params = msg->params;
+                if (params->type == JSON_ARRAY
+                    && params->u.array.n == 2
+                    && params->u.array.elems[0]->type == JSON_NULL) {
+                    monitor2_print(params->u.array.elems[1], mts, n_mts);
                     fflush(stdout);
                 }
             }
@@ -895,6 +1020,20 @@ do_monitor(struct jsonrpc *rpc, const char *database,
         unixctl_server_wait(unixctl);
         poll_block();
     }
+}
+
+static void
+do_monitor(struct jsonrpc *rpc, const char *database,
+           int argc, char *argv[])
+{
+    do_monitor__(rpc, database, OVSDB_MONITOR_V1, argc, argv);
+}
+
+static void
+do_monitor2(struct jsonrpc *rpc, const char *database,
+           int argc, char *argv[])
+{
+    do_monitor__(rpc, database, OVSDB_MONITOR_V2, argc, argv);
 }
 
 struct dump_table_aux {
@@ -963,7 +1102,8 @@ compare_columns(const void *a_, const void *b_)
 }
 
 static void
-dump_table(const struct ovsdb_table_schema *ts, struct json_array *rows)
+dump_table(const char *table_name, const struct shash *cols,
+           struct json_array *rows)
 {
     const struct ovsdb_column **columns;
     size_t n_columns;
@@ -976,9 +1116,9 @@ dump_table(const struct ovsdb_table_schema *ts, struct json_array *rows)
     size_t x, y;
 
     /* Sort columns by name, for reproducibility. */
-    columns = xmalloc(shash_count(&ts->columns) * sizeof *columns);
+    columns = xmalloc(shash_count(cols) * sizeof *columns);
     n_columns = 0;
-    SHASH_FOR_EACH (node, &ts->columns) {
+    SHASH_FOR_EACH (node, cols) {
         struct ovsdb_column *column = node->data;
         if (strcmp(column->name, "_version")) {
             columns[n_columns++] = column;
@@ -993,7 +1133,7 @@ dump_table(const struct ovsdb_table_schema *ts, struct json_array *rows)
 
         if (rows->elems[y]->type != JSON_OBJECT) {
             ovs_fatal(0,  "row %"PRIuSIZE" in table %s response is not a JSON object: "
-                      "%s", y, ts->name, json_to_string(rows->elems[y], 0));
+                      "%s", y, table_name, json_to_string(rows->elems[y], 0));
         }
         row = json_object(rows->elems[y]);
 
@@ -1002,7 +1142,7 @@ dump_table(const struct ovsdb_table_schema *ts, struct json_array *rows)
             const struct json *json = shash_find_data(row, columns[x]->name);
             if (!json) {
                 ovs_fatal(0, "row %"PRIuSIZE" in table %s response lacks %s column",
-                          y, ts->name, columns[x]->name);
+                          y, table_name, columns[x]->name);
             }
 
             check_ovsdb_error(ovsdb_datum_from_json(&data[y][x],
@@ -1019,7 +1159,7 @@ dump_table(const struct ovsdb_table_schema *ts, struct json_array *rows)
 
     /* Add column headings. */
     table_init(&t);
-    table_set_caption(&t, xasprintf("%s table", ts->name));
+    table_set_caption(&t, xasprintf("%s table", table_name));
     for (x = 0; x < n_columns; x++) {
         table_add_column(&t, "%s", columns[x]->name);
     }
@@ -1044,34 +1184,59 @@ dump_table(const struct ovsdb_table_schema *ts, struct json_array *rows)
 
 static void
 do_dump(struct jsonrpc *rpc, const char *database,
-        int argc OVS_UNUSED, char *argv[] OVS_UNUSED)
+        int argc, char *argv[])
 {
     struct jsonrpc_msg *request, *reply;
     struct ovsdb_schema *schema;
     struct json *transaction;
 
-    const struct shash_node **tables;
+    const struct shash_node *node, **tables;
     size_t n_tables;
+    struct ovsdb_table_schema *tschema;
+    const struct shash *columns;
+    struct shash custom_columns;
 
     size_t i;
 
+    shash_init(&custom_columns);
     schema = fetch_schema(rpc, database);
-    tables = shash_sort(&schema->tables);
-    n_tables = shash_count(&schema->tables);
+    if (argc) {
+        node = shash_find(&schema->tables, argv[0]);
+        if (!node) {
+            ovs_fatal(0, "No table \"%s\" found.", argv[0]);
+        }
+        tables = xmemdup(&node, sizeof(&node));
+        n_tables = 1;
+        tschema = tables[0]->data;
+        for (i = 1; i < argc; i++) {
+            node = shash_find(&tschema->columns, argv[i]);
+            if (!node) {
+                ovs_fatal(0, "Table \"%s\" has no column %s.", argv[0], argv[1]);
+            }
+            shash_add(&custom_columns, argv[1], node->data);
+        }
+    } else {
+        tables = shash_sort(&schema->tables);
+        n_tables = shash_count(&schema->tables);
+    }
 
     /* Construct transaction to retrieve entire database. */
     transaction = json_array_create_1(json_string_create(database));
     for (i = 0; i < n_tables; i++) {
         const struct ovsdb_table_schema *ts = tables[i]->data;
-        struct json *op, *columns;
-        struct shash_node *node;
+        struct json *op, *jcolumns;
 
-        columns = json_array_create_empty();
-        SHASH_FOR_EACH (node, &ts->columns) {
+        if (argc > 1) {
+            columns = &custom_columns;
+        } else {
+            columns = &ts->columns;
+        }
+        jcolumns = json_array_create_empty();
+        SHASH_FOR_EACH (node, columns) {
             const struct ovsdb_column *column = node->data;
 
             if (strcmp(column->name, "_version")) {
-                json_array_add(columns, json_string_create(column->name));
+                json_array_add(jcolumns, json_string_create(column->name));
             }
         }
 
@@ -1079,7 +1244,7 @@ do_dump(struct jsonrpc *rpc, const char *database,
         json_object_put_string(op, "op", "select");
         json_object_put_string(op, "table", tables[i]->name);
         json_object_put(op, "where", json_array_create_empty());
-        json_object_put(op, "columns", columns);
+        json_object_put(op, "columns", jcolumns);
         json_array_add(transaction, op);
     }
 
@@ -1106,10 +1271,15 @@ do_dump(struct jsonrpc *rpc, const char *database,
                       ts->name, json_to_string(op_result, 0));
         }
 
-        dump_table(ts, &rows->u.array);
+        if (argc > 1) {
+            dump_table(tables[i]->name, &custom_columns, &rows->u.array);
+        } else {
+            dump_table(tables[i]->name, &ts->columns, &rows->u.array);
+        }
     }
 
     jsonrpc_msg_destroy(reply);
+    shash_destroy(&custom_columns);
     free(tables);
     ovsdb_schema_destroy(schema);
 }
@@ -1136,8 +1306,8 @@ static const struct ovsdb_client_command all_commands[] = {
     { "list-columns",       NEED_DATABASE, 0, 1,       do_list_columns },
     { "transact",           NEED_RPC,      1, 1,       do_transact },
     { "monitor",            NEED_DATABASE, 1, INT_MAX, do_monitor },
-    { "dump",               NEED_DATABASE, 0, 0,       do_dump },
-
+    { "monitor2",           NEED_DATABASE, 1, INT_MAX, do_monitor2 },
+    { "dump",               NEED_DATABASE, 0, INT_MAX, do_dump },
     { "help",               NEED_NONE,     0, INT_MAX, do_help },
 
     { NULL,                 0,             0, 0,       NULL },

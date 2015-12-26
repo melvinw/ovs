@@ -38,7 +38,9 @@ struct ds;
 /* Tunnel information used in flow key and metadata. */
 struct flow_tnl {
     ovs_be32 ip_dst;
+    struct in6_addr ipv6_dst;
     ovs_be32 ip_src;
+    struct in6_addr ipv6_src;
     ovs_be64 tun_id;
     uint16_t flags;
     uint8_t ip_tos;
@@ -72,12 +74,23 @@ struct flow_tnl {
 /* Tunnel information is in userspace datapath format. */
 #define FLOW_TNL_F_UDPIF (1 << 4)
 
+static inline bool ipv6_addr_is_set(const struct in6_addr *addr);
+
+static inline bool
+flow_tnl_dst_is_set(const struct flow_tnl *tnl)
+{
+    return tnl->ip_dst || ipv6_addr_is_set(&tnl->ipv6_dst);
+}
+
+struct in6_addr flow_tnl_dst(const struct flow_tnl *tnl);
+struct in6_addr flow_tnl_src(const struct flow_tnl *tnl);
+
 /* Returns an offset to 'src' covering all the meaningful fields in 'src'. */
 static inline size_t
 flow_tnl_size(const struct flow_tnl *src)
 {
-    if (!src->ip_dst) {
-        /* Covers ip_dst only. */
+    if (!flow_tnl_dst_is_set(src)) {
+        /* Covers ip_dst and ipv6_dst only. */
         return offsetof(struct flow_tnl, ip_src);
     }
     if (src->flags & FLOW_TNL_F_UDPIF) {
@@ -145,6 +158,7 @@ pkt_metadata_init(struct pkt_metadata *md, odp_port_t port)
      * looked at. */
     memset(md, 0, offsetof(struct pkt_metadata, in_port));
     md->tunnel.ip_dst = 0;
+    md->tunnel.ipv6_dst = in6addr_any;
 
     md->in_port.odp_port = port;
 }
@@ -316,6 +330,7 @@ ovs_be32 set_mpls_lse_values(uint8_t ttl, uint8_t tc, uint8_t bos,
 #define ETH_ADDR_ARGS(EA) ETH_ADDR_BYTES_ARGS((EA).ea)
 #define ETH_ADDR_BYTES_ARGS(EAB) \
          (EAB)[0], (EAB)[1], (EAB)[2], (EAB)[3], (EAB)[4], (EAB)[5]
+#define ETH_ADDR_STRLEN 17
 
 /* Example:
  *
@@ -566,7 +581,10 @@ ip_is_local_multicast(ovs_be32 ip)
 }
 int ip_count_cidr_bits(ovs_be32 netmask);
 void ip_format_masked(ovs_be32 ip, ovs_be32 mask, struct ds *);
+bool ip_parse(const char *s, ovs_be32 *ip);
 char *ip_parse_masked(const char *s, ovs_be32 *ip, ovs_be32 *mask)
+    OVS_WARN_UNUSED_RESULT;
+char *ip_parse_cidr(const char *s, ovs_be32 *ip, unsigned int *plen)
     OVS_WARN_UNUSED_RESULT;
 
 #define IP_VER(ip_ihl_ver) ((ip_ihl_ver) >> 4)
@@ -719,16 +737,32 @@ struct tcp_header {
 BUILD_ASSERT_DECL(TCP_HEADER_LEN == sizeof(struct tcp_header));
 
 /* Connection states */
-#define CS_NEW               0x01
-#define CS_ESTABLISHED       0x02
-#define CS_RELATED           0x04
-#define CS_INVALID           0x20
-#define CS_REPLY_DIR         0x40
-#define CS_TRACKED           0x80
+enum {
+    CS_NEW_BIT =         0,
+    CS_ESTABLISHED_BIT = 1,
+    CS_RELATED_BIT =     2,
+    CS_REPLY_DIR_BIT =   3,
+    CS_INVALID_BIT =     4,
+    CS_TRACKED_BIT =     5,
+    CS_SRC_NAT_BIT =     6,
+    CS_DST_NAT_BIT =     7,
+};
+
+enum {
+    CS_NEW =         (1 << CS_NEW_BIT),
+    CS_ESTABLISHED = (1 << CS_ESTABLISHED_BIT),
+    CS_RELATED =     (1 << CS_RELATED_BIT),
+    CS_REPLY_DIR =   (1 << CS_REPLY_DIR_BIT),
+    CS_INVALID =     (1 << CS_INVALID_BIT),
+    CS_TRACKED =     (1 << CS_TRACKED_BIT),
+    CS_SRC_NAT =     (1 << CS_SRC_NAT_BIT),
+    CS_DST_NAT =     (1 << CS_DST_NAT_BIT),
+};
 
 /* Undefined connection state bits. */
 #define CS_SUPPORTED_MASK    (CS_NEW | CS_ESTABLISHED | CS_RELATED \
-                              | CS_INVALID | CS_REPLY_DIR | CS_TRACKED)
+                              | CS_INVALID | CS_REPLY_DIR | CS_TRACKED \
+                              | CS_SRC_NAT | CS_DST_NAT)
 #define CS_UNSUPPORTED_MASK  (~(uint32_t)CS_SUPPORTED_MASK)
 
 #define ARP_HRD_ETHERNET 1
@@ -753,6 +787,8 @@ struct arp_eth_header {
     ovs_16aligned_be32 ar_tpa;  /* Target protocol address. */
 };
 BUILD_ASSERT_DECL(ARP_ETH_HEADER_LEN == sizeof(struct arp_eth_header));
+
+#define IPV6_HEADER_LEN 40
 
 /* Like struct in6_addr, but whereas that struct requires 32-bit alignment on
  * most implementations, this one only requires 16-bit alignment. */
@@ -793,6 +829,8 @@ struct icmp6_header {
     ovs_be16 icmp6_cksum;
 };
 BUILD_ASSERT_DECL(ICMP6_HEADER_LEN == sizeof(struct icmp6_header));
+
+uint32_t packet_csum_pseudoheader6(const struct ovs_16aligned_ip6_hdr *);
 
 /* Neighbor Discovery option field.
  * ND options are always a multiple of 8 bytes in size. */
@@ -899,13 +937,18 @@ static inline bool ipv6_addr_is_multicast(const struct in6_addr *ip) {
     return ip->s6_addr[0] == 0xff;
 }
 
-static inline void
-in6_addr_set_mapped_ipv4(struct in6_addr *addr, ovs_be32 ip4)
+static inline struct in6_addr
+in6_addr_mapped_ipv4(ovs_be32 ip4)
 {
-    union ovs_16aligned_in6_addr *taddr = (void *) addr;
-    memset(taddr->be16, 0, sizeof(taddr->be16));
-    taddr->be16[5] = OVS_BE16_MAX;
-    put_16aligned_be32(&taddr->be32[3], ip4);
+    struct in6_addr ip6 = { .s6_addr = { [10] = 0xff, [11] = 0xff } };
+    memcpy(&ip6.s6_addr[12], &ip4, 4);
+    return ip6;
+}
+
+static inline void
+in6_addr_set_mapped_ipv4(struct in6_addr *ip6, ovs_be32 ip4)
+{
+    *ip6 = in6_addr_mapped_ipv4(ip4);
 }
 
 static inline ovs_be32
@@ -917,6 +960,28 @@ in6_addr_get_mapped_ipv4(const struct in6_addr *addr)
     } else {
         return INADDR_ANY;
     }
+}
+
+static inline void
+in6_addr_solicited_node(struct in6_addr *addr, const struct in6_addr *ip6)
+{
+    union ovs_16aligned_in6_addr *taddr = (void *) addr;
+    memset(taddr->be16, 0, sizeof(taddr->be16));
+    taddr->be16[0] = htons(0xff02);
+    taddr->be16[5] = htons(0x1);
+    taddr->be16[6] = htons(0xff00);
+    memcpy(&addr->s6_addr[13], &ip6->s6_addr[13], 3);
+}
+
+static inline void
+ipv6_multicast_to_ethernet(struct eth_addr *eth, const struct in6_addr *ip6)
+{
+    eth->ea[0] = 0x33;
+    eth->ea[1] = 0x33;
+    eth->ea[2] = ip6->s6_addr[12];
+    eth->ea[3] = ip6->s6_addr[13];
+    eth->ea[4] = ip6->s6_addr[14];
+    eth->ea[5] = ip6->s6_addr[15];
 }
 
 static inline bool dl_type_is_ip_any(ovs_be16 dl_type)
@@ -950,16 +1015,24 @@ struct vxlanhdr {
 
 #define VXLAN_FLAGS 0x08000000  /* struct vxlanhdr.vx_flags required value. */
 
-void format_ipv6_addr(char *addr_str, const struct in6_addr *addr);
-void print_ipv6_addr(struct ds *string, const struct in6_addr *addr);
-void print_ipv6_mapped(struct ds *string, const struct in6_addr *addr);
-void print_ipv6_masked(struct ds *string, const struct in6_addr *addr,
-                       const struct in6_addr *mask);
+void ipv6_format_addr(const struct in6_addr *addr, struct ds *);
+void ipv6_format_addr_bracket(const struct in6_addr *addr, struct ds *,
+                              bool bracket);
+void ipv6_format_mapped(const struct in6_addr *addr, struct ds *);
+void ipv6_format_masked(const struct in6_addr *addr,
+                        const struct in6_addr *mask, struct ds *);
+const char * ipv6_string_mapped(char *addr_str, const struct in6_addr *addr);
 struct in6_addr ipv6_addr_bitand(const struct in6_addr *src,
                                  const struct in6_addr *mask);
 struct in6_addr ipv6_create_mask(int mask);
 int ipv6_count_cidr_bits(const struct in6_addr *netmask);
 bool ipv6_is_cidr(const struct in6_addr *netmask);
+
+bool ipv6_parse(const char *s, struct in6_addr *ip);
+char *ipv6_parse_masked(const char *s, struct in6_addr *ipv6,
+                        struct in6_addr *mask);
+char *ipv6_parse_cidr(const char *s, struct in6_addr *ip, unsigned int *plen)
+    OVS_WARN_UNUSED_RESULT;
 
 void *eth_compose(struct dp_packet *, const struct eth_addr eth_dst,
                   const struct eth_addr eth_src, uint16_t eth_type,
@@ -985,6 +1058,8 @@ void compose_arp(struct dp_packet *, uint16_t arp_op,
                  const struct eth_addr arp_sha,
                  const struct eth_addr arp_tha, bool broadcast,
                  ovs_be32 arp_spa, ovs_be32 arp_tpa);
+void compose_nd(struct dp_packet *, const struct eth_addr eth_src,
+                struct in6_addr *, struct in6_addr *);
 uint32_t packet_csum_pseudoheader(const struct ip_header *);
 
 #endif /* packets.h */

@@ -1132,7 +1132,7 @@ AT_KEYWORDS([ofp-print])
 AT_CHECK([ovs-ofctl ofp-print "\
 05 11 00 10 00 00 00 02 02 00 00 00 00 00 00 00 \
 " 3], [0], [dnl
-OFPT_TABLE_MOD (OF1.4) (xid=0x2): table_id=2, eviction=off
+OFPT_TABLE_MOD (OF1.4) (xid=0x2): table_id=2, eviction=off, vacancy=off
 ])
 AT_CLEANUP
 
@@ -2821,6 +2821,30 @@ OFPT_SET_ASYNC (OF1.4) (xid=0x2):
      ROLE_STATUS: (off)
     TABLE_STATUS: (off)
   REQUESTFORWARD: (off)
+])
+AT_CLEANUP
+
+AT_SETUP([OFPT_SET_ASYNC_CONFIG - invalid mask - OF1.4])
+AT_KEYWORDS([ofp-print])
+AT_CHECK([ovs-ofctl ofp-print "\
+05 1c 00 38 00 00 00 02 00 00 00 08 00 00 00 40 \
+00 01 00 08 00 00 00 02 00 02 00 08 00 00 00 02 \
+00 03 00 08 00 00 00 05 00 04 00 08 00 00 00 1c \
+00 05 00 08 00 00 00 05 \
+"], [0], [dnl
+OFPT_SET_ASYNC (OF1.4) (xid=0x2): ***decode error: OFPACFC_INVALID***
+])
+AT_CLEANUP
+
+AT_SETUP([OFPT_SET_ASYNC_CONFIG - unsupported configuration - OF1.4])
+AT_KEYWORDS([ofp-print])
+AT_CHECK([ovs-ofctl ofp-print "\
+05 1c 00 38 00 00 00 02 00 00 00 08 00 00 00 05 \
+00 11 00 08 00 00 00 02 00 02 00 08 00 00 00 02 \
+00 03 00 08 00 00 00 05 00 04 00 08 00 00 00 1c \
+00 05 00 08 00 00 00 05\
+"], [0], [dnl
+OFPT_SET_ASYNC (OF1.4) (xid=0x2): ***decode error: OFPACFC_UNSUPPORTED***
 ])
 AT_CLEANUP
 

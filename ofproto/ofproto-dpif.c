@@ -1236,7 +1236,7 @@ check_masked_set_action(struct dpif_backer *backer)
     return !error;
 }
 
-#define CHECK_FEATURE__(NAME, FIELD)                                        \
+#define CHECK_FEATURE__(NAME, SUPPORT, FIELD, VALUE)                        \
 static bool                                                                 \
 check_##NAME(struct dpif_backer *backer)                                    \
 {                                                                           \
@@ -1247,12 +1247,12 @@ check_##NAME(struct dpif_backer *backer)                                    \
     struct odp_flow_key_parms odp_parms = {                                 \
         .flow = &flow,                                                      \
         .support = {                                                        \
-            .NAME = true,                                                   \
+            .SUPPORT = true,                                                \
         },                                                                  \
     };                                                                      \
                                                                             \
     memset(&flow, 0, sizeof flow);                                          \
-    flow.FIELD = 1;                                                         \
+    flow.FIELD = VALUE;                                                     \
                                                                             \
     ofpbuf_use_stack(&key, &keybuf, sizeof keybuf);                         \
     odp_flow_key_from_flow(&odp_parms, &key);                               \
@@ -1267,12 +1267,13 @@ check_##NAME(struct dpif_backer *backer)                                    \
                                                                             \
     return enable;                                                          \
 }
-#define CHECK_FEATURE(FIELD) CHECK_FEATURE__(FIELD, FIELD)
+#define CHECK_FEATURE(FIELD) CHECK_FEATURE__(FIELD, FIELD, FIELD, 1)
 
 CHECK_FEATURE(ct_state)
 CHECK_FEATURE(ct_zone)
 CHECK_FEATURE(ct_mark)
-CHECK_FEATURE__(ct_label, ct_label.u64.lo)
+CHECK_FEATURE__(ct_label, ct_label, ct_label.u64.lo, 1)
+CHECK_FEATURE__(ct_state_nat, ct_state, ct_state, CS_TRACKED|CS_SRC_NAT)
 
 #undef CHECK_FEATURE
 #undef CHECK_FEATURE__
@@ -1293,6 +1294,8 @@ check_support(struct dpif_backer *backer)
     backer->support.odp.ct_zone = check_ct_zone(backer);
     backer->support.odp.ct_mark = check_ct_mark(backer);
     backer->support.odp.ct_label = check_ct_label(backer);
+
+    backer->support.odp.ct_state_nat = check_ct_state_nat(backer);
 }
 
 static int
@@ -1635,8 +1638,6 @@ wait(struct ofproto *ofproto_)
     mcast_snooping_wait(ofproto->ms);
     stp_wait(ofproto);
     if (ofproto->backer->need_revalidate) {
-        /* Shouldn't happen, but if it does just go around again. */
-        VLOG_DBG_RL(&rl, "need revalidate in ofproto_wait_cb()");
         poll_immediate_wake();
     }
 
@@ -3730,7 +3731,10 @@ ofproto_dpif_execute_actions__(struct ofproto_dpif *ofproto,
     xin.resubmit_stats = &stats;
     xin.recurse = recurse;
     xin.resubmits = resubmits;
-    xlate_actions(&xin, &xout);
+    if (xlate_actions(&xin, &xout) != XLATE_OK) {
+        error = EINVAL;
+        goto out;
+    }
 
     execute.actions = odp_actions.data;
     execute.actions_len = odp_actions.size;
@@ -3749,7 +3753,7 @@ ofproto_dpif_execute_actions__(struct ofproto_dpif *ofproto,
     execute.packet->md.in_port.odp_port = ofp_port_to_odp_port(ofproto, in_port);
 
     error = dpif_execute(ofproto->backer->dpif, &execute);
-
+out:
     xlate_out_uninit(&xout);
     ofpbuf_uninit(&odp_actions);
 
@@ -4012,37 +4016,91 @@ rule_dealloc(struct rule *rule_)
 }
 
 static enum ofperr
-rule_check(struct rule *rule)
+check_mask(struct ofproto_dpif *ofproto, const struct miniflow *flow)
 {
+    const struct odp_support *support;
     uint16_t ct_state, ct_zone;
-    const ovs_u128 *labelp;
-    ovs_u128 ct_label = { { 0, 0 } };
+    ovs_u128 ct_label;
     uint32_t ct_mark;
 
-    ct_state = MINIFLOW_GET_U16(rule->cr.match.flow, ct_state);
-    ct_zone = MINIFLOW_GET_U16(rule->cr.match.flow, ct_zone);
-    ct_mark = MINIFLOW_GET_U32(rule->cr.match.flow, ct_mark);
-    labelp = MINIFLOW_GET_U128_PTR(rule->cr.match.flow, ct_label);
-    if (labelp) {
-        ct_label = *labelp;
+    support = &ofproto_dpif_get_support(ofproto)->odp;
+    ct_state = MINIFLOW_GET_U16(flow, ct_state);
+    if (support->ct_state && support->ct_zone && support->ct_mark
+        && support->ct_label && support->ct_state_nat) {
+        return ct_state & CS_UNSUPPORTED_MASK ? OFPERR_OFPBMC_BAD_MASK : 0;
     }
 
-    if (ct_state || ct_zone || ct_mark
-        || !ovs_u128_is_zero(&ct_label)) {
-        struct ofproto_dpif *ofproto = ofproto_dpif_cast(rule->ofproto);
-        const struct odp_support *support = &ofproto_dpif_get_support(ofproto)->odp;
+    ct_zone = MINIFLOW_GET_U16(flow, ct_zone);
+    ct_mark = MINIFLOW_GET_U32(flow, ct_mark);
+    ct_label = MINIFLOW_GET_U128(flow, ct_label);
 
-        if ((ct_state && !support->ct_state)
-            || (ct_zone && !support->ct_zone)
-            || (ct_mark && !support->ct_mark)
-            || (!ovs_u128_is_zero(&ct_label) && !support->ct_label)) {
-            return OFPERR_OFPBMC_BAD_FIELD;
-        }
-        if (ct_state & CS_UNSUPPORTED_MASK) {
-            return OFPERR_OFPBMC_BAD_MASK;
-        }
+    if ((ct_state && !support->ct_state)
+        || (ct_state & CS_UNSUPPORTED_MASK)
+        || ((ct_state & (CS_SRC_NAT | CS_DST_NAT)) && !support->ct_state_nat)
+        || (ct_zone && !support->ct_zone)
+        || (ct_mark && !support->ct_mark)
+        || (!ovs_u128_is_zero(&ct_label) && !support->ct_label)) {
+        return OFPERR_OFPBMC_BAD_MASK;
     }
+
     return 0;
+}
+
+static enum ofperr
+check_actions(const struct ofproto_dpif *ofproto,
+              const struct rule_actions *const actions)
+{
+    const struct ofpact *ofpact;
+
+    OFPACT_FOR_EACH (ofpact, actions->ofpacts, actions->ofpacts_len) {
+        const struct odp_support *support;
+        const struct ofpact_conntrack *ct;
+        const struct ofpact *a;
+
+        if (ofpact->type != OFPACT_CT) {
+            continue;
+        }
+
+        ct = CONTAINER_OF(ofpact, struct ofpact_conntrack, ofpact);
+        support = &ofproto_dpif_get_support(ofproto)->odp;
+
+        if (!support->ct_state) {
+            return OFPERR_OFPBAC_BAD_TYPE;
+        }
+        if ((ct->zone_imm || ct->zone_src.field) && !support->ct_zone) {
+            return OFPERR_OFPBAC_BAD_ARGUMENT;
+        }
+
+        OFPACT_FOR_EACH(a, ct->actions, ofpact_ct_get_action_len(ct)) {
+            const struct mf_field *dst = ofpact_get_mf_dst(a);
+
+            if (a->type == OFPACT_NAT && !support->ct_state_nat) {
+                /* The backer doesn't seem to support the NAT bits in
+                 * 'ct_state': assume that it doesn't support the NAT
+                 * action. */
+                return OFPERR_OFPBAC_BAD_TYPE;
+            }
+            if (dst && ((dst->id == MFF_CT_MARK && !support->ct_mark)
+                        || (dst->id == MFF_CT_LABEL && !support->ct_label))) {
+                return OFPERR_OFPBAC_BAD_SET_ARGUMENT;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static enum ofperr
+rule_check(struct rule *rule)
+{
+    struct ofproto_dpif *ofproto = ofproto_dpif_cast(rule->ofproto);
+    enum ofperr err;
+
+    err = check_mask(ofproto, &rule->cr.match.mask->masks);
+    if (err) {
+        return err;
+    }
+    return check_actions(ofproto, rule->actions);
 }
 
 static enum ofperr
@@ -4540,7 +4598,7 @@ ofproto_unixctl_mcast_snooping_show(struct unixctl_conn *conn,
             ofputil_port_to_string(ofbundle_get_a_port(bundle)->up.ofp_port,
                                    name, sizeof name);
             ds_put_format(&ds, "%5s  %4d  ", name, grp->vlan);
-            print_ipv6_mapped(&ds, &grp->addr);
+            ipv6_format_mapped(&grp->addr, &ds);
             ds_put_format(&ds, "         %3d\n",
                           mcast_bundle_age(ofproto->ms, b));
         }
@@ -4946,13 +5004,18 @@ ofproto_unixctl_trace_actions(struct unixctl_conn *conn, int argc,
         goto exit;
     }
     if (enforce_consistency) {
-        retval = ofpacts_check_consistency(ofpacts.data, ofpacts.size,
-                                           &flow, u16_to_ofp(ofproto->up.max_ports),
-                                           0, 0, usable_protocols);
+        retval = ofpacts_check_consistency(ofpacts.data, ofpacts.size, &flow,
+                                           u16_to_ofp(ofproto->up.max_ports),
+                                           0, ofproto->up.n_tables,
+                                           usable_protocols);
     } else {
         retval = ofpacts_check(ofpacts.data, ofpacts.size, &flow,
-                               u16_to_ofp(ofproto->up.max_ports), 0, 0,
-                               &usable_protocols);
+                               u16_to_ofp(ofproto->up.max_ports), 0,
+                               ofproto->up.n_tables, &usable_protocols);
+    }
+    if (!retval) {
+        retval = ofproto_check_ofpacts(&ofproto->up, ofpacts.data,
+                                       ofpacts.size);
     }
 
     if (retval) {
@@ -4988,6 +5051,7 @@ ofproto_trace(struct ofproto_dpif *ofproto, struct flow *flow,
               struct ds *ds)
 {
     struct trace_ctx trace;
+    enum xlate_error error;
 
     ds_put_format(ds, "Bridge: %s\n", ofproto->up.name);
     ds_put_cstr(ds, "Flow: ");
@@ -5007,8 +5071,7 @@ ofproto_trace(struct ofproto_dpif *ofproto, struct flow *flow,
     trace.xin.resubmit_hook = trace_resubmit;
     trace.xin.report_hook = trace_report_valist;
 
-    xlate_actions(&trace.xin, &trace.xout);
-
+    error = xlate_actions(&trace.xin, &trace.xout);
     ds_put_char(ds, '\n');
     trace_format_flow(ds, 0, "Final flow", &trace);
     trace_format_megaflow(ds, 0, "Megaflow", &trace);
@@ -5016,7 +5079,10 @@ ofproto_trace(struct ofproto_dpif *ofproto, struct flow *flow,
     ds_put_cstr(ds, "Datapath actions: ");
     format_odp_actions(ds, trace.odp_actions.data, trace.odp_actions.size);
 
-    if (trace.xout.slow) {
+    if (error != XLATE_OK) {
+        ds_put_format(ds, "\nTranslation failed (%s), packet is dropped.\n",
+                      xlate_strerror(error));
+    } else if (trace.xout.slow) {
         enum slow_path_reason slow;
 
         ds_put_cstr(ds, "\nThis flow is handled by the userspace "
@@ -5262,6 +5328,8 @@ disable_tnl_push_pop(struct unixctl_conn *conn OVS_UNUSED, int argc OVS_UNUSED,
         ofproto_use_tnl_push_pop = true;
         unixctl_command_reply(conn, "Tunnel push-pop on");
         ofproto_revalidate_all_backers();
+    } else {
+        unixctl_command_reply_error(conn, "Invalid argument");
     }
 }
 
