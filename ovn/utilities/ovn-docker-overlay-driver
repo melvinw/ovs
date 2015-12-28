@@ -68,6 +68,11 @@ def ovn_nbctl(*args):
     args_list.insert(0, database_option)
     return call_prog("ovn-nbctl", args_list)
 
+def ovn_sbctl(*args):
+    args_list = list(args)
+    database_option = "%s=%s" % ("--db", OVN_REMOTE)
+    args_list.insert(0, database_option)
+    return call_prog("ovn-sbctl", args_list)
 
 def cleanup():
     if os.path.isfile(PLUGIN_FILE):
@@ -226,7 +231,7 @@ def create_endpoint():
     ip_address = ip_address_and_mask.rsplit('/', 1)[0]
     mac_address_input = interface.get("MacAddress", "")
     mac_address_output = ""
-
+    
     try:
         ovn_nbctl("lport-add", nid, eid)
     except Exception as e:
@@ -253,6 +258,15 @@ def create_endpoint():
     mac_address_output = ""
     if not mac_address_input:
         mac_address_output = mac_address
+
+    try:
+        encap_ip = ovs_vsctl("get", "open_vswitch", ".",
+            "external_ids:ovn-encap-ip").communicate().strip('"')
+        chassis = "di-%s" % (encap_id.replace(".", "-"),)
+        ovn_sbctl("lport-bind", eid, chassis)
+    except Exception as e:
+        error = "create_endpoint: lport-bind (%s)" % (str(e))
+        return jsonify({'Err': error})
 
     return jsonify({"Interface": {
                                     "Address": "",
